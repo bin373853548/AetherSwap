@@ -1559,6 +1559,80 @@ def test_batch_fallback_log_preserves_actual_preview_reason():
     assert any("降级" in msg and reason in msg for msg in logs)
 
 
+def test_batch_fallback_refetches_snapshot_instead_of_skipping_the_purchase():
+    """A read-only batch preview may outlive the sell-order cache TTL.
+
+    The single-item fallback must refresh and re-validate the snapshot before
+    locking, instead of aborting with a stale-snapshot warning and buying
+    nothing.
+    """
+    item = _item([{"id": "sell-1", "price": "10.0"},
+                  {"id": "sell-2", "price": "10.0"}])
+
+    class BuffClient:
+        _pay_method = "alipay"
+        batch_pay_methods = ("wechat", "alipay")
+
+        def __init__(self):
+            self.refreshes = 0
+            self.lock_calls = 0
+
+        def try_batch_buy(self, *_args):
+            # The preview POST is read-only, yet slow enough to expire the TTL.
+            item["_buff_sell_orders_fetched_at"] = time.time() - 30
+            return {"success": False, "created": False, "code": "NOT_SUPPORTED",
+                    "msg": "BUFF 未提供当前支付方式的批量付款选项: 该订单不支持支付宝余额"}
+
+        def get_sell_orders(self, *_args):
+            self.refreshes += 1
+            return [{"id": "sell-2", "price": "10.0"},
+                    {"id": "sell-3", "price": "10.0"}]
+
+        def lock_and_get_pay_url(self, *_args, **_kwargs):
+            self.lock_calls += 1
+            return {"success": False, "created": False, "code": "FAIL",
+                    "msg": "rejected"}
+
+    client = BuffClient()
+    kwargs, _pending, _purchases = _checkout_args()
+    logs = []
+    steps.lock_and_confirm_payment(
+        client, item, _config(),
+        log_fn=lambda msg, _level: logs.append(msg), **kwargs)
+
+    assert client.refreshes == 1
+    assert client.lock_calls == 1
+    assert not any("本次不发送锁单请求" in msg for msg in logs)
+
+
+def test_fallback_with_unrefreshable_snapshot_never_locks():
+    item = _item([{"id": "sell-1", "price": "10.0"},
+                  {"id": "sell-2", "price": "10.0"}])
+
+    class BuffClient:
+        _pay_method = "alipay"
+        batch_pay_methods = ("wechat", "alipay")
+
+        def try_batch_buy(self, *_args):
+            item["_buff_sell_orders_fetched_at"] = time.time() - 30
+            return {"success": False, "created": False, "code": "NOT_SUPPORTED",
+                    "msg": "BUFF 未提供当前支付方式的批量付款选项: 该订单不支持支付宝余额"}
+
+        def get_sell_orders(self, *_args):
+            return []
+
+        def lock_and_get_pay_url(self, *_args, **_kwargs):
+            raise AssertionError("a stale snapshot must never be locked")
+
+    kwargs, _pending, _purchases = _checkout_args()
+    logs = []
+    result = steps.lock_and_confirm_payment(
+        BuffClient(), item, _config(),
+        log_fn=lambda msg, _level: logs.append(msg), **kwargs)
+
+    assert result is None
+    assert any("本次不发送锁单请求" in msg for msg in logs)
+
 def test_guarded_runner_sets_error_for_unhandled_exception(monkeypatch):
     state = _FakeState()
     monkeypatch.setattr(pipeline_module, "get_state", lambda: state)

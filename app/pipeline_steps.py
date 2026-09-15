@@ -1706,12 +1706,81 @@ def lock_and_confirm_payment(
             batch_id=batch_id,
         )
 
-    def _write_snapshot_is_fresh() -> bool:
+    def _refresh_stale_sell_orders() -> Optional[_PurchaseAttempt]:
+        """Re-fetch the sell-order snapshot when read-only work outlived its TTL.
+
+        Steam checks and the batch preview both cost time, so the snapshot that
+        was fresh when the candidate was chosen can expire before the write.
+        Refresh once and re-run the price guards instead of locking a stale
+        sell_order_id or silently skipping an otherwise valid purchase.
+        """
+
+        nonlocal orders, lowest_price, count_at_lowest
         if _buff_orders_cache_is_fresh(item, orders_cache_ttl):
-            return True
+            return None
         if log_fn:
-            log_fn("[Buff]   → 写入前卖单快照已超过 TTL，本次不发送锁单请求", "warn")
-        return False
+            log_fn(
+                f"[Buff]   → 卖单快照已超过 {orders_cache_ttl:.1f} 秒 TTL，重新拉取后再决定是否锁单",
+                "info",
+            )
+        fetch_orders = getattr(buff_client, "get_sell_orders", None)
+        refreshed_orders = (
+            fetch_orders(goods_id, game_buff) if callable(fetch_orders) else None
+        )
+        if not refreshed_orders:
+            if log_fn:
+                log_fn("[Buff]   → 快照过期且刷新失败，本次不发送锁单请求", "warn")
+            return _PurchaseAttempt(
+                _PurchaseAttemptStatus.FAILED,
+                reason="卖单快照已过期且刷新失败",
+            )
+        orders = refreshed_orders
+        _cache_buff_sell_orders(item, orders)
+        lowest_price, count_at_lowest = count_lowest_price_orders(orders)
+        if lowest_price <= 0:
+            if log_fn:
+                log_fn("[Buff]   → 刷新后最低价无效，本次不发送锁单请求", "warn")
+            return _PurchaseAttempt(
+                _PurchaseAttemptStatus.FAILED,
+                reason="刷新后的卖单最低价无效",
+            )
+        if log_fn:
+            log_fn(
+                f"[Buff]   → 已刷新卖单快照 → 最低价={lowest_price:.2f} 同价数量={count_at_lowest}",
+                "info",
+            )
+        if _affordable_quantity(target_balance, acc, lowest_price) < 1:
+            return _PurchaseAttempt(
+                _PurchaseAttemptStatus.FAILED,
+                reason="刷新后价格超出剩余预算",
+            )
+        if plan_price is not None and lowest_price - plan_price > tolerance:
+            if log_fn:
+                log_fn("[Buff]   → 刷新后价格超出容忍，本次不发送锁单请求", "warn")
+            return _PurchaseAttempt(
+                _PurchaseAttemptStatus.FAILED,
+                reason="刷新后的卖单价格超出容忍",
+            )
+        if max_discount is not None:
+            if ref_price is None or ref_price <= 0:
+                return _PurchaseAttempt(
+                    _PurchaseAttemptStatus.FAILED,
+                    reason="刷新后缺少 Steam 参考价",
+                )
+            refreshed_ratio = (lowest_price / ref_price) * STEAM_FEE_FACTOR
+            if refreshed_ratio >= max_discount:
+                if log_fn:
+                    log_fn(
+                        f"[Buff]   → 刷新后二次验证未通过，比例={refreshed_ratio:.4f} 需<{max_discount}",
+                        "warn",
+                    )
+                return _PurchaseAttempt(
+                    _PurchaseAttemptStatus.FAILED,
+                    reason="刷新后的卖单未通过二次验证",
+                )
+        if ref_price and lowest_price > 0:
+            item["value_ratio"] = (lowest_price / ref_price) * STEAM_FEE_FACTOR
+        return None
 
     def _time_window_is_open() -> bool:
         if is_time_allowed is None:
@@ -1723,11 +1792,9 @@ def lock_and_confirm_payment(
             return False
 
     def _try_single_buy() -> _PurchaseAttempt:
-        if not _write_snapshot_is_fresh():
-            return _PurchaseAttempt(
-                _PurchaseAttemptStatus.FAILED,
-                reason="写入前卖单快照已过期",
-            )
+        stale_snapshot = _refresh_stale_sell_orders()
+        if stale_snapshot is not None:
+            return stale_snapshot
         o = first_order_at_price(orders, lowest_price)
         if not o:
             return _PurchaseAttempt(
@@ -1997,11 +2064,9 @@ def lock_and_confirm_payment(
                 _PurchaseAttemptStatus.SAFE_TO_FALLBACK,
                 reason="当前支付方式不支持批量购买，且尚未发送写请求",
             )
-        if not _write_snapshot_is_fresh():
-            return _PurchaseAttempt(
-                _PurchaseAttemptStatus.FAILED,
-                reason="写入前卖单快照已过期",
-            )
+        stale_snapshot = _refresh_stale_sell_orders()
+        if stale_snapshot is not None:
+            return stale_snapshot
         if not _time_window_is_open():
             return _PurchaseAttempt(
                 _PurchaseAttemptStatus.TIME_WINDOW_CLOSED,
