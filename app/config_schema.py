@@ -41,12 +41,16 @@ DEFAULTS = {
         "huge_profit_offset": 0.05,
         "iflow_top_n": 50,
         "exclude_keywords": ["印花"],
-        "sell_price_ratio": 1.0,
         "verbose_debug": False,
         "sell_strategy": 4,
         "sell_price_offset": 0,
         "sell_price_wall_volume": 20,
         "sell_price_max_ignore_volume": 4,
+        "sell_price_min_tier_volume": 3,
+        "sell_price_max_ratio": 1.1,
+        "sell_anchor_max_ratio": 1.05,
+        "sell_anchor_days": 3,
+        "sell_liquidity_ratio": 0.05,
         "sell_trend_days": 7,
         "retry_interval_seconds": 300,
         "buff_retry_delay_seconds": 5,
@@ -63,6 +67,13 @@ DEFAULTS = {
         "listing_check_interval_seconds": 600,
         "max_listings_per_item": 5,
         "listing_delay_seconds": 3,
+        "sell_reconcile_enabled": True,
+        "sell_cost_floor_enabled": True,
+        "sell_cost_floor_ratio": 1.0,
+        "sell_reprice_enabled": True,
+        "sell_reprice_min_drop_pct": 5,
+        "sell_reprice_max_age_hours": 72,
+        "sell_reprice_min_interval_hours": 6,
         "steam_listings_debug": False,
         "start_time_limit_enabled": False,
         "start_time_hour": 8,
@@ -186,6 +197,60 @@ def _validate_ranges(cfg: dict) -> dict:
         v = stab["price_percentile_ceil_rising"]
         if not (0 < v <= 1):
             stab["price_percentile_ceil_rising"] = max(0.001, min(v, 1.0))
+
+    if isinstance(pipe.get("sell_price_max_ratio"), (int, float)):
+        v = pipe["sell_price_max_ratio"]
+        if not (0 < v <= 10):
+            warnings.warn(f"[config] pipeline.sell_price_max_ratio={v} 超出范围(0,10]，已修正为 {min(max(v, 0.01), 10.0):.4g}")
+            pipe["sell_price_max_ratio"] = min(max(v, 0.01), 10.0)
+
+    if isinstance(pipe.get("sell_price_min_tier_volume"), (int, float)):
+        v = pipe["sell_price_min_tier_volume"]
+        if v < 0:
+            warnings.warn(f"[config] pipeline.sell_price_min_tier_volume={v} 不能为负数，已修正为0")
+            pipe["sell_price_min_tier_volume"] = 0
+
+    if isinstance(pipe.get("sell_anchor_max_ratio"), (int, float)):
+        v = pipe["sell_anchor_max_ratio"]
+        if not (0 <= v <= 5):
+            warnings.warn(f"[config] pipeline.sell_anchor_max_ratio={v} 超出范围[0,5]，已修正为 {min(max(v, 0.0), 5.0):.4g}")
+            pipe["sell_anchor_max_ratio"] = min(max(v, 0.0), 5.0)
+
+    if isinstance(pipe.get("sell_anchor_days"), (int, float)):
+        v = pipe["sell_anchor_days"]
+        if v < 1:
+            warnings.warn(f"[config] pipeline.sell_anchor_days={v} 至少为1，已修正为1")
+            pipe["sell_anchor_days"] = 1
+
+    if isinstance(pipe.get("sell_liquidity_ratio"), (int, float)):
+        v = pipe["sell_liquidity_ratio"]
+        if v < 0:
+            warnings.warn(f"[config] pipeline.sell_liquidity_ratio={v} 不能为负数，已修正为0")
+            pipe["sell_liquidity_ratio"] = 0.0
+
+    if isinstance(pipe.get("sell_cost_floor_ratio"), (int, float)):
+        v = pipe["sell_cost_floor_ratio"]
+        if v < 0:
+            warnings.warn(f"[config] pipeline.sell_cost_floor_ratio={v} 不能为负数，已修正为0")
+            pipe["sell_cost_floor_ratio"] = 0.0
+
+    if isinstance(pipe.get("sell_reprice_min_drop_pct"), (int, float)):
+        v = pipe["sell_reprice_min_drop_pct"]
+        if v < 0:
+            warnings.warn(f"[config] pipeline.sell_reprice_min_drop_pct={v} 不能为负数，已修正为0")
+            pipe["sell_reprice_min_drop_pct"] = 0.0
+
+    if isinstance(pipe.get("sell_reprice_max_age_hours"), (int, float)):
+        v = pipe["sell_reprice_max_age_hours"]
+        if v < 0:
+            warnings.warn(f"[config] pipeline.sell_reprice_max_age_hours={v} 不能为负数，已修正为0")
+            pipe["sell_reprice_max_age_hours"] = 0.0
+
+    if isinstance(pipe.get("sell_reprice_min_interval_hours"), (int, float)):
+        v = pipe["sell_reprice_min_interval_hours"]
+        if v < 0:
+            warnings.warn(f"[config] pipeline.sell_reprice_min_interval_hours={v} 不能为负数，已修正为0")
+            pipe["sell_reprice_min_interval_hours"] = 0.0
 
     if isinstance(buff.get("price_tolerance"), (int, float)):
         v = buff["price_tolerance"]

@@ -407,3 +407,57 @@ def test_get_sell_orders_cny_ssr预取错变体时回退新版_orderbook_action(
     )
 
     assert result == {"lowest_price": 8.9, "sell_orders": [(8.9, 1)]}
+
+
+def test_智能定价_薄档阈值放宽后跟随最低卖单():
+    from steam import market_orders
+
+    # 低价区全是 1 件的小档，最后才是 58.99 的价格墙（真实 Dragomir | Sabre 盘口形态）
+    book = [
+        (46.75, 1),
+        (48.0, 1),
+        (50.0, 1),
+        (52.0, 1),
+        (54.0, 1),
+        (58.99, 4),
+        (59.0, 6),
+    ]
+
+    default_price, _ = market_orders.compute_smart_list_price(book)
+    relaxed_price, _ = market_orders.compute_smart_list_price(
+        book, min_lowest_tier_volume=0
+    )
+
+    assert default_price == 58.98
+    assert relaxed_price == 53.99
+
+
+def test_智能定价_挂价上限压回最低卖单附近():
+    from steam import market_orders
+
+    book = [(50.0, 1), (52.0, 1), (54.0, 1), (58.99, 4), (59.0, 6)]
+
+    price, reason = market_orders.compute_smart_list_price(book, max_price_ratio=1.1)
+
+    assert price == 55.0
+    assert "限幅" in reason
+
+
+def test_智能定价_挂价上限缺省不改变原有行为():
+    from steam import market_orders
+
+    book = [(50.0, 1), (52.0, 1), (54.0, 1), (58.99, 4), (59.0, 6)]
+
+    price, reason = market_orders.compute_smart_list_price(book)
+
+    assert price == 58.98
+    assert "限幅" not in reason
+
+
+def test_智能定价_挂价上限非法值不生效():
+    from steam import market_orders
+
+    book = [(50.0, 1), (52.0, 1), (54.0, 1), (58.99, 4), (59.0, 6)]
+
+    assert market_orders.compute_smart_list_price(book, max_price_ratio="abc")[0] == 58.98
+    assert market_orders.compute_smart_list_price(book, max_price_ratio=0)[0] == 58.98

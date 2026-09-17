@@ -825,6 +825,60 @@ def _get_dynamic_thresholds(current_price: float) -> Tuple[float, float]:
     if current_price < 500.0:
         return 5.0, 0.02
     return 10.0, 0.015
+def _price_ceiling(lowest_ask: float, max_price_ratio: Optional[float], min_floor_price: float) -> Optional[float]:
+    """挂价上限：最低卖单价 × 系数。
+
+    薄簿饰品（低价区全是 1~3 件的小档）会被断层跳跃推到远离行情的价位，
+    这里给最终挂价加一条上界，避免挂单长期无法成交。
+    """
+    try:
+        ratio = float(max_price_ratio)
+    except (TypeError, ValueError):
+        return None
+    if ratio <= 0 or lowest_ask <= 0:
+        return None
+    return max(float(min_floor_price), round(lowest_ask * ratio, 2))
+def _sale_anchor_ceiling(
+    median_sale_price: Optional[float],
+    max_ratio: Optional[float],
+    min_floor_price: float,
+) -> Optional[float]:
+    """成交锚上限：近期成交中位价 × 系数。
+
+    卖单簿只反映“卖家想卖多少”，薄簿饰品很容易被散档价格带偏；
+    这里再用近期真实成交中位价加一条上界，避免挂价脱离实际成交水平。
+    """
+    try:
+        ratio = float(max_ratio)
+        median = float(median_sale_price)
+    except (TypeError, ValueError):
+        return None
+    if ratio <= 0 or median <= 0:
+        return None
+    return max(float(min_floor_price), round(median * ratio, 2))
+
+
+def _apply_price_ceilings(
+    final: float,
+    reason: str,
+    lowest_ask: float,
+    max_price_ratio: Optional[float],
+    min_floor_price: float,
+    recent_sale_price: Optional[float],
+    anchor_max_ratio: Optional[float],
+) -> Tuple[float, str]:
+    """Cap *final* by the lowest-ask ratio and the recent sale anchor."""
+    ceiling = _price_ceiling(lowest_ask, max_price_ratio, min_floor_price)
+    if ceiling is not None and final > ceiling:
+        final = ceiling
+        reason = f"{reason}，限幅≤{ceiling:.2f}"
+    anchor_ceiling = _sale_anchor_ceiling(recent_sale_price, anchor_max_ratio, min_floor_price)
+    if anchor_ceiling is not None and final > anchor_ceiling:
+        final = anchor_ceiling
+        reason = f"{reason}，成交锚≤{anchor_ceiling:.2f}"
+    return round(final, 2), reason
+
+
 def compute_smart_list_price(
     sell_orders: List[Tuple[float, int]],
     *,
@@ -834,10 +888,14 @@ def compute_smart_list_price(
     min_step: float = 0.01,
     min_floor_price: float = STEAM_MIN_PRICE,
     offset: float = 0.0,
+    max_price_ratio: Optional[float] = None,
+    recent_sale_price: Optional[float] = None,
+    anchor_max_ratio: Optional[float] = None,
 ) -> Tuple[Optional[float], str]:
     if not sell_orders:
         return None, "无卖单数据"
     sell_orders = sorted(sell_orders, key=lambda x: x[0])
+    lowest_ask = float(sell_orders[0][0])
     while len(sell_orders) >= 2 and sell_orders[0][1] <= min_lowest_tier_volume:
         sell_orders = sell_orders[1:]
     if not sell_orders:
@@ -853,7 +911,10 @@ def compute_smart_list_price(
     if len(analysis_scope) < 2:
         target = analysis_scope[0][0] - min_step
         final = max(min_floor_price, target + offset)
-        return round(final, 2), "单档无断层"
+        return _apply_price_ceilings(
+            final, "单档无断层", lowest_ask, max_price_ratio, min_floor_price,
+            recent_sale_price, anchor_max_ratio,
+        )
     final_price = analysis_scope[0][0] - min_step
     reason = "常规压价"
     current_ignore_vol = 0
@@ -871,7 +932,10 @@ def compute_smart_list_price(
             final_price = p_next - min_step
             reason = f"断层跳跃({p_curr:.2f}→{p_next:.2f})"
     final = max(min_floor_price, final_price + offset)
-    return round(final, 2), reason
+    return _apply_price_ceilings(
+        final, reason, lowest_ask, max_price_ratio, min_floor_price,
+        recent_sale_price, anchor_max_ratio,
+    )
 def get_lowest_sell_price_cny(
     session,
     market_hash_name: str,

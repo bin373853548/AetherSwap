@@ -116,8 +116,6 @@ async function refreshStatus() {
     const statusText = raw === "running" ? "运行中" : raw === "error" ? "错误" : raw === "stopped" ? "已停止" : "空闲中";
     const top = el("status-text");
     if (top) top.textContent = statusText;
-    const inline = el("status-text-inline");
-    if (inline) inline.textContent = statusText;
     const stepDesc = d.step || "";
     const item = d.progress_item || "";
     const newText = stepDesc && item ? `${stepDesc}：${item}` : (stepDesc || item || "—");
@@ -548,7 +546,6 @@ function bindEvents() {
     const steamLinkEl = el("add-purchase-steam-link");
     const priceEl = el("add-purchase-price");
     const qtyEl = el("add-purchase-quantity");
-    const goodsIdEl = el("add-purchase-goods-id");
     const name = (nameEl?.value || "").trim();
     const steamLink = (steamLinkEl?.value || "").trim();
     const price = priceEl ? parseFloat(priceEl.value) : NaN;
@@ -562,15 +559,9 @@ function bindEvents() {
       return;
     }
     if (!Number.isFinite(qty) || qty < 1) qty = 1;
-    const goodsId = goodsIdEl?.value ? parseInt(goodsIdEl.value, 10) : null;
-    if (goodsId !== null && isNaN(goodsId)) {
-      toast("goods_id 须为数字");
-      return;
-    }
     try {
       const payload = { name, price, quantity: qty };
       if (steamLink) payload.steam_link = steamLink;
-      if (goodsId != null && goodsId > 0) payload.goods_id = goodsId;
       const res = await fetchJson(API + "/purchase", {
         method: "POST",
         body: JSON.stringify(payload),
@@ -583,7 +574,6 @@ function bindEvents() {
       if (steamLinkEl) steamLinkEl.value = "";
       if (priceEl) priceEl.value = "";
       if (qtyEl) qtyEl.value = "1";
-      if (goodsIdEl) goodsIdEl.value = "";
       await refreshTransactions();
       refreshStatus();
       toast(res.added > 1 ? `已添加 ${res.added} 条操作记录` : "已添加操作记录");

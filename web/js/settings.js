@@ -31,7 +31,6 @@ async function loadConfig() {
   const i = c.iflow || {};
   const b = c.buff || {};
   const p = c.pipeline || {};
-  const s = c.stability || {};
   const inv = c.inventory || {};
   const sys = c.system || {};
   const gGames = el("cfg-games");
@@ -48,72 +47,12 @@ async function loadConfig() {
   if (gMinVolume) gMinVolume.value = i.min_volume ?? "";
   const gPay = el("cfg-pay_method");
   if (gPay) gPay.value = (b.pay_method || "wechat").toLowerCase();
-  const gTarget = el("cfg-target_balance");
-  if (gTarget) gTarget.value = p.target_balance ?? "";
-  const gMaxDisc = el("cfg-max_discount");
-  if (gMaxDisc) gMaxDisc.value = p.max_discount ?? 0.8;
-  const gHugeProfitOffset = el("cfg-huge_profit_offset");
-  if (gHugeProfitOffset) gHugeProfitOffset.value = p.huge_profit_offset ?? "";
-  const gIflowTopN = el("cfg-iflow_top_n");
-  if (gIflowTopN) gIflowTopN.value = p.iflow_top_n ?? "";
-  const gExclude = el("cfg-exclude_keywords");
-  if (gExclude) gExclude.value = (p.exclude_keywords && p.exclude_keywords.length > 0 ? p.exclude_keywords : ["印花"]).join("\n");
-  const gCv = el("cfg-cv_threshold");
-  if (gCv) gCv.value = s.cv_threshold ?? "";
-  const gR2 = el("cfg-r2_threshold");
-  if (gR2) gR2.value = s.r2_threshold ?? "";
-  const gPpCeil = el("cfg-price_percentile_ceil");
-  if (gPpCeil) gPpCeil.value = s.price_percentile_ceil ?? "";
-  const gR2Rising = el("cfg-r2_rising_threshold");
-  if (gR2Rising) gR2Rising.value = s.r2_rising_threshold ?? "";
-  const gSlopeCeil = el("cfg-slope_pct_ceil");
-  if (gSlopeCeil) gSlopeCeil.value = s.slope_pct_ceil ?? "";
-  const gMaCeil = el("cfg-ma_deviation_ceil");
-  if (gMaCeil) gMaCeil.value = s.ma_deviation_ceil ?? "";
-  const gLpMa30Ceil = el("cfg-last_price_ma30_ceil");
-  if (gLpMa30Ceil) gLpMa30Ceil.value = s.last_price_ma30_ceil ?? "";
-  const gSlopeFloor = el("cfg-slope_stable_floor");
-  if (gSlopeFloor) gSlopeFloor.value = s.slope_stable_floor ?? "";
-  const gPpRising = el("cfg-price_percentile_ceil_rising");
-  if (gPpRising) gPpRising.value = s.price_percentile_ceil_rising ?? "";
-  const gUseVwap = el("cfg-use_vwap");
-  if (gUseVwap) gUseVwap.checked = s.use_vwap !== false;
   const gRetrySec = el("cfg-retry_interval_seconds");
   if (gRetrySec) gRetrySec.value = p.retry_interval_seconds ?? "";
   const verboseCb = el("cfg-verbose-debug");
   if (verboseCb) verboseCb.checked = !!p.verbose_debug;
   const steamListingsDebugCb = el("cfg-steam-listings-debug");
   if (steamListingsDebugCb) steamListingsDebugCb.checked = !!p.steam_listings_debug;
-  const sellStrategy = el("cfg-sell_strategy");
-  if (sellStrategy) sellStrategy.value = String(p.sell_strategy ?? 1);
-  const sellOffset = el("cfg-sell_price_offset");
-  if (sellOffset) sellOffset.value = p.sell_price_offset ?? "";
-  const wallVol = el("cfg-sell_price_wall_volume");
-  if (wallVol) wallVol.value = p.sell_price_wall_volume ?? "";
-  const maxIgnore = el("cfg-sell_price_max_ignore_volume");
-  if (maxIgnore) maxIgnore.value = p.sell_price_max_ignore_volume ?? "";
-  const sellTrendDays = el("cfg-sell_trend_days");
-  if (sellTrendDays) sellTrendDays.value = p.sell_trend_days ?? "";
-  const maxListingsPerItem = el("cfg-max_listings_per_item");
-  if (maxListingsPerItem) maxListingsPerItem.value = p.max_listings_per_item ?? "";
-  const listingDelayEl = el("cfg-listing_delay_seconds");
-  if (listingDelayEl) listingDelayEl.value = p.listing_delay_seconds ?? "";
-  const resellRatioEl = el("cfg-resell_ratio");
-  if (resellRatioEl) resellRatioEl.value = p.resell_ratio ?? "";
-  const safeHardCap = el("cfg-safe_purchase_hard_qty_cap");
-  if (safeHardCap) safeHardCap.value = p.safe_purchase_hard_qty_cap ?? "";
-  const safeLiqRatio = el("cfg-safe_purchase_liquidity_ratio");
-  if (safeLiqRatio) safeLiqRatio.value = p.safe_purchase_liquidity_ratio ?? "";
-  const safeLowPriceThresh = el("cfg-safe_purchase_low_price_threshold");
-  if (safeLowPriceThresh) safeLowPriceThresh.value = p.safe_purchase_low_price_threshold ?? "";
-  const safeLowPricePenalty = el("cfg-safe_purchase_low_price_penalty");
-  if (safeLowPricePenalty) safeLowPricePenalty.value = p.safe_purchase_low_price_penalty ?? "";
-  const safeLowPriceCap = el("cfg-safe_purchase_low_price_hard_cap");
-  if (safeLowPriceCap) safeLowPriceCap.value = p.safe_purchase_low_price_hard_cap ?? "";
-  const sellPressureN = el("cfg-sell_pressure_orders_n");
-  if (sellPressureN) sellPressureN.value = p.sell_pressure_orders_n ?? "";
-  const sellPressureThresh = el("cfg-sell_pressure_threshold");
-  if (sellPressureThresh) sellPressureThresh.value = p.sell_pressure_threshold ?? "";
   const currentPriceRefreshEl = el("cfg-current-price-refresh-minutes");
   if (currentPriceRefreshEl) currentPriceRefreshEl.value = p.current_price_refresh_minutes ?? "";
   currentPriceRefreshMinutes = parseInt(p.current_price_refresh_minutes, 10) || currentPriceRefreshMinutes || 10;
@@ -137,8 +76,6 @@ async function loadConfig() {
   if (gHoldingsReport) gHoldingsReport.value = n.holdings_report_interval_hours ?? "";
   const gHoldingsThreshold = el("cfg-holdings_report_change_threshold_pct");
   if (gHoldingsThreshold) gHoldingsThreshold.value = n.holdings_report_change_threshold_pct ?? "";
-  const gHoldingsDropEnabled = el("cfg-holdings-drop-enabled");
-  if (gHoldingsDropEnabled) gHoldingsDropEnabled.checked = n.holdings_report_drop_enabled !== false;
   const gEmailUser = el("cfg-email_user");
   if (gEmailUser) gEmailUser.value = n.email_user ?? "";
   const gEmailPass = el("cfg-email_pass");
@@ -217,58 +154,15 @@ function formToConfig() {
     },
     buff: {
       pay_method: el("cfg-pay_method") ? el("cfg-pay_method").value : undefined,
-      game: el("cfg-buff-game") ? el("cfg-buff-game").value.trim() : undefined,
-      price_tolerance: el("cfg-price_tolerance") ? parseFloat(el("cfg-price_tolerance").value) || undefined : undefined,
     },
     pipeline: {
-      target_balance: el("cfg-target_balance") ? parseFloat(el("cfg-target_balance").value) || undefined : undefined,
-      max_discount: el("cfg-max_discount") ? parseFloat(el("cfg-max_discount").value) || undefined : undefined,
-      huge_profit_offset: el("cfg-huge_profit_offset") ? parseFloat(el("cfg-huge_profit_offset").value) : undefined,
-      iflow_top_n: el("cfg-iflow_top_n") ? parseInt(el("cfg-iflow_top_n").value, 10) || undefined : undefined,
-      sell_price_ratio: el("cfg-sell_ratio") ? parseFloat(el("cfg-sell_ratio").value) || undefined : undefined,
       retry_interval_seconds: el("cfg-retry_interval_seconds") ? parseInt(el("cfg-retry_interval_seconds").value, 10) || undefined : undefined,
-      exclude_keywords: el("cfg-exclude_keywords") ? Array.from(
-        new Set(
-          (el("cfg-exclude_keywords").value || "")
-            .split(/\n/)
-            .map((s) => s.trim())
-            .filter(Boolean)
-        )
-      ) : undefined,
       verbose_debug: el("cfg-verbose-debug") ? el("cfg-verbose-debug").checked : false,
       steam_listings_debug: el("cfg-steam-listings-debug") ? el("cfg-steam-listings-debug").checked : false,
-      sell_strategy: el("cfg-sell_strategy") ? parseInt(el("cfg-sell_strategy").value, 10) || 1 : undefined,
-      sell_price_offset: el("cfg-sell_price_offset") ? parseFloat(el("cfg-sell_price_offset").value) || 0 : undefined,
-      sell_price_wall_volume: el("cfg-sell_price_wall_volume") ? parseInt(el("cfg-sell_price_wall_volume").value, 10) : undefined,
-      sell_price_max_ignore_volume: el("cfg-sell_price_max_ignore_volume") ? parseInt(el("cfg-sell_price_max_ignore_volume").value, 10) : undefined,
-      sell_trend_days: el("cfg-sell_trend_days") ? parseInt(el("cfg-sell_trend_days").value, 10) || undefined : undefined,
-      max_listings_per_item: el("cfg-max_listings_per_item") ? parseInt(el("cfg-max_listings_per_item").value, 10) || undefined : undefined,
-      listing_delay_seconds: el("cfg-listing_delay_seconds") ? parseInt(el("cfg-listing_delay_seconds").value, 10) || undefined : undefined,
-      resell_ratio: el("cfg-resell_ratio") ? parseFloat(el("cfg-resell_ratio").value) || undefined : undefined,
-      safe_purchase_hard_qty_cap: el("cfg-safe_purchase_hard_qty_cap") ? parseInt(el("cfg-safe_purchase_hard_qty_cap").value, 10) : undefined,
-      safe_purchase_liquidity_ratio: el("cfg-safe_purchase_liquidity_ratio") ? parseFloat(el("cfg-safe_purchase_liquidity_ratio").value) : undefined,
-      safe_purchase_low_price_threshold: el("cfg-safe_purchase_low_price_threshold") ? parseFloat(el("cfg-safe_purchase_low_price_threshold").value) : undefined,
-      safe_purchase_low_price_penalty: el("cfg-safe_purchase_low_price_penalty") ? parseFloat(el("cfg-safe_purchase_low_price_penalty").value) : undefined,
-      safe_purchase_low_price_hard_cap: el("cfg-safe_purchase_low_price_hard_cap") ? parseInt(el("cfg-safe_purchase_low_price_hard_cap").value, 10) : undefined,
-      sell_pressure_orders_n: el("cfg-sell_pressure_orders_n") ? parseInt(el("cfg-sell_pressure_orders_n").value, 10) : undefined,
-      sell_pressure_threshold: el("cfg-sell_pressure_threshold") ? parseFloat(el("cfg-sell_pressure_threshold").value) : undefined,
       current_price_refresh_minutes: el("cfg-current-price-refresh-minutes") ? parseInt(el("cfg-current-price-refresh-minutes").value, 10) || undefined : undefined,
       start_time_limit_enabled: !!el("cfg-start-time-limit-enabled")?.checked,
       start_time_hour: el("cfg-start-time-hour") ? (parseInt(el("cfg-start-time-hour").value, 10) >= 0 && parseInt(el("cfg-start-time-hour").value, 10) <= 23 ? parseInt(el("cfg-start-time-hour").value, 10) : undefined) : undefined,
       end_time_hour: el("cfg-end-time-hour") ? (parseInt(el("cfg-end-time-hour").value, 10) >= 0 && parseInt(el("cfg-end-time-hour").value, 10) <= 23 ? parseInt(el("cfg-end-time-hour").value, 10) : undefined) : undefined,
-    },
-    stability: {
-      days: el("cfg-stability-days") ? parseInt(el("cfg-stability-days").value, 10) || undefined : undefined,
-      cv_threshold: el("cfg-cv_threshold") ? parseFloat(el("cfg-cv_threshold").value) || undefined : undefined,
-      r2_threshold: el("cfg-r2_threshold") ? parseFloat(el("cfg-r2_threshold").value) || undefined : undefined,
-      price_percentile_ceil: el("cfg-price_percentile_ceil") ? parseFloat(el("cfg-price_percentile_ceil").value) : undefined,
-      r2_rising_threshold: el("cfg-r2_rising_threshold") ? parseFloat(el("cfg-r2_rising_threshold").value) : undefined,
-      slope_pct_ceil: el("cfg-slope_pct_ceil") ? parseFloat(el("cfg-slope_pct_ceil").value) : undefined,
-      ma_deviation_ceil: el("cfg-ma_deviation_ceil") ? parseFloat(el("cfg-ma_deviation_ceil").value) : undefined,
-      last_price_ma30_ceil: el("cfg-last_price_ma30_ceil") ? parseFloat(el("cfg-last_price_ma30_ceil").value) : undefined,
-      slope_stable_floor: el("cfg-slope_stable_floor") ? parseFloat(el("cfg-slope_stable_floor").value) : undefined,
-      price_percentile_ceil_rising: el("cfg-price_percentile_ceil_rising") ? parseFloat(el("cfg-price_percentile_ceil_rising").value) : undefined,
-      use_vwap: el("cfg-use_vwap") ? el("cfg-use_vwap").checked : undefined,
     },
     inventory: {
       refresh_seconds: el("cfg-inv-refresh") ? parseInt(el("cfg-inv-refresh").value, 10) || undefined : undefined,
@@ -277,7 +171,6 @@ function formToConfig() {
       pushplus_token: el("cfg-pushplus_token") ? el("cfg-pushplus_token").value.trim() : undefined,
       holdings_report_interval_hours: el("cfg-holdings_report_interval_hours") ? parseInt(el("cfg-holdings_report_interval_hours").value, 10) : undefined,
       holdings_report_change_threshold_pct: el("cfg-holdings_report_change_threshold_pct") ? parseFloat(el("cfg-holdings_report_change_threshold_pct").value) : undefined,
-      holdings_report_drop_enabled: el("cfg-holdings-drop-enabled") ? !!el("cfg-holdings-drop-enabled").checked : undefined,
       email_user: el("cfg-email_user") ? el("cfg-email_user").value.trim() : undefined,
       email_pass: el("cfg-email_pass") ? el("cfg-email_pass").value.trim() : undefined,
       imap_server: el("cfg-imap_server") ? el("cfg-imap_server").value.trim() : undefined,
@@ -790,7 +683,6 @@ async function updateUXStatus(cfg) {
     accounts = d.accounts || [];
   } catch (e) { }
   updateNavBadges(cfg, accounts);
-  renderGettingStartedCard(cfg, accounts);
 }
 
 function updateNavBadges(cfg, accounts) {
@@ -805,69 +697,6 @@ function updateNavBadges(cfg, accounts) {
 
   const badgeAccounts = el("nav-badge-accounts");
   if (badgeAccounts) badgeAccounts.classList.toggle("hidden", accountOk);
-}
-
-function renderGettingStartedCard(cfg, accounts) {
-  const card = el("getting-started-card");
-  if (!card) return;
-
-  // 已被用户手动关闭时不再显示
-  if (localStorage.getItem("aetherswap_gs_card_closed") === "1") {
-    card.style.display = "none";
-    return;
-  }
-
-  const sg = cfg.steam_guard || {};
-  const sc = cfg.steam_confirm || {};
-  const n = cfg.notify || {};
-
-  const steps = [
-    {
-      done: !!sg.shared_secret && !!sc.identity_secret,
-      label: "填写 Steam 令牌密钥（<span class='gs-link' onclick='document.querySelector(\"[data-tab=settings]\").click()'>系统设置 → Steam 令牌</span>）",
-    },
-    {
-      done: !!n.pushplus_token,
-      label: "填写 PushPlus 推送 Token（<span class='gs-link' onclick='document.querySelector(\"[data-tab=settings]\").click()'>系统设置 → 推送与邮箱</span>）",
-    },
-    {
-      done: accounts.length > 0,
-      label: "添加 Steam 账号并登录（<span class='gs-link' onclick='document.querySelector(\"[data-tab=accounts]\").click()'>账号管理</span>）",
-    },
-    {
-      done: accounts.length > 0 && !!sg.shared_secret && !!sc.identity_secret && !!n.pushplus_token,
-      label: "返回仪表盘点击「启动任务」🚀",
-    },
-  ];
-
-  const allDone = steps.every((s) => s.done);
-  if (allDone) {
-    card.style.display = "none";
-    return;
-  }
-
-  card.style.display = "";
-  const stepsEl = el("gs-steps");
-  if (!stepsEl) return;
-  stepsEl.innerHTML = steps
-    .map(
-      (s) =>
-        `<div class="gs-step ${s.done ? "done" : ""}">
-          <span class="gs-icon">${s.done ? "✅" : "⬜"}</span>
-          <span>${s.label}</span>
-        </div>`
-    )
-    .join("");
-
-  // 绑定关闭按钮（只绑一次）
-  const closeBtn = el("btn-gs-close");
-  if (closeBtn && !closeBtn._bound) {
-    closeBtn._bound = true;
-    closeBtn.addEventListener("click", () => {
-      localStorage.setItem("aetherswap_gs_card_closed", "1");
-      card.style.display = "none";
-    });
-  }
 }
 
 function bindUXEvents() {

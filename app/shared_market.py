@@ -14,6 +14,8 @@ def get_steam_smart_price_cny(session, market_hash_name: str, app_id: int = 730)
     cfg = load_app_config_validated().get("pipeline", {})
     wall_volume = int(cfg.get("sell_price_wall_volume", 20))
     max_ignore = int(cfg.get("sell_price_max_ignore_volume", 4))
+    min_tier_volume = max(0, int(cfg.get("sell_price_min_tier_volume", 3) or 0))
+    max_price_ratio = cfg.get("sell_price_max_ratio")
     result = get_sell_orders_cny(session, market_hash_name, app_id=app_id, request_delay=1.0)
     if not result or not result.get("sell_orders"):
         return None
@@ -21,6 +23,8 @@ def get_steam_smart_price_cny(session, market_hash_name: str, app_id: int = 730)
         result["sell_orders"],
         wall_volume_threshold=wall_volume,
         max_ignore_volume=max_ignore,
+        min_lowest_tier_volume=min_tier_volume,
+        max_price_ratio=max_price_ratio,
         min_step=0,
         offset=0,
     )

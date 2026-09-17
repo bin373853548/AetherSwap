@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 USD_TO_CNY_DEFAULT = 7.2
 CURRENCY_CNY = "CNY"
+# Steam market take rate (5% publisher + 10% Steam).  Buyer-pays price divided
+# by this factor approximates the seller's net proceeds.
+STEAM_FEE_FACTOR = 1.15
 CURRENCY_USD = "USD"
 _EXCHANGE_RATE_FILE = Path(__file__).resolve().parent.parent / "config" / "exchange_rate.json"
 _EXCHANGE_RATE_TTL = 300

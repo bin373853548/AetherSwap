@@ -259,7 +259,10 @@ BUILTIN_MODULES: Dict[str, Dict[str, Any]] = {
         "category": "guard",
         "strategy_types": ["sell"],
         "description": "同一饰品名的在售数量达到上限后不再继续上架。",
-        "params_schema": {"max_listings_per_item": {"type": "integer", "min": 1, "default": 5, "label": "同名在售上限"}},
+        "params_schema": {
+            "max_listings_per_item": {"type": "integer", "min": 1, "default": 5, "label": "同名在售上限"},
+            "sell_liquidity_ratio": {"type": "number", "min": 0, "max": 1, "default": 0.05, "label": "卖出侧流动性比例（日成交量占比，0=不限制）"},
+        },
     },
     "pricing.steam_wall_gap": {
         "id": "pricing.steam_wall_gap",
@@ -270,6 +273,10 @@ BUILTIN_MODULES: Dict[str, Dict[str, Any]] = {
         "params_schema": {
             "sell_price_wall_volume": {"type": "integer", "min": 1, "default": 20, "label": "价格墙数量阈值"},
             "sell_price_max_ignore_volume": {"type": "integer", "min": 0, "default": 4, "label": "断层跳跃容忍量"},
+            "sell_price_min_tier_volume": {"type": "integer", "min": 0, "default": 3, "label": "薄档忽略数量（挂价前丢弃的最低档位件数）"},
+            "sell_price_max_ratio": {"type": "number", "min": 0.01, "max": 10, "default": 1.1, "label": "挂价上限倍数（相对最低卖单）"},
+            "sell_anchor_max_ratio": {"type": "number", "min": 0, "max": 5, "default": 1.05, "label": "成交锚上限倍数（相对近期成交价，0=不限制）"},
+            "sell_anchor_days": {"type": "integer", "min": 1, "default": 3, "label": "成交锚统计天数"},
             "sell_price_offset": {"type": "number", "default": 0, "label": "价格补偿"},
         },
     },
@@ -282,6 +289,10 @@ BUILTIN_MODULES: Dict[str, Dict[str, Any]] = {
         "params_schema": {
             "sell_price_wall_volume": {"type": "integer", "min": 1, "default": 20, "label": "价格墙数量阈值"},
             "sell_price_max_ignore_volume": {"type": "integer", "min": 0, "default": 4, "label": "断层跳跃容忍量"},
+            "sell_price_min_tier_volume": {"type": "integer", "min": 0, "default": 3, "label": "薄档忽略数量（挂价前丢弃的最低档位件数）"},
+            "sell_price_max_ratio": {"type": "number", "min": 0.01, "max": 10, "default": 1.1, "label": "挂价上限倍数（相对最低卖单）"},
+            "sell_anchor_max_ratio": {"type": "number", "min": 0, "max": 5, "default": 1.05, "label": "成交锚上限倍数（相对近期成交价，0=不限制）"},
+            "sell_anchor_days": {"type": "integer", "min": 1, "default": 3, "label": "成交锚统计天数"},
         },
     },
     "pricing.price_offset": {
@@ -310,6 +321,16 @@ BUILTIN_MODULES: Dict[str, Dict[str, Any]] = {
         "description": "当前买入/挂刀价比例不能高于购入时比例的指定倍数。",
         "params_schema": {"profit_ratio_multiplier": {"type": "number", "min": 1, "default": 1.05, "label": "利润比例倍数"}},
     },
+    "guard.sell_cost_floor": {
+        "id": "guard.sell_cost_floor",
+        "name": "卖出成本底线",
+        "category": "guard",
+        "strategy_types": ["sell"],
+        "description": "到手金额低于成本×底线倍数时不上架，避免亏损卖出（默认回本即1.0）。",
+        "params_schema": {
+            "sell_cost_floor_ratio": {"type": "number", "min": 0, "default": 1, "label": "成本底线倍数（到手/成本）"},
+        },
+    },
     "action.pause_auto_sell": {
         "id": "action.pause_auto_sell",
         "name": "暂停自动出售",
@@ -323,8 +344,13 @@ BUILTIN_MODULES: Dict[str, Dict[str, Any]] = {
         "name": "Steam 上架",
         "category": "action",
         "strategy_types": ["sell"],
-        "description": "按策略计算价格后提交 Steam 上架。",
-        "params_schema": {},
+        "description": "按策略计算价格后提交 Steam 上架，并可对已挂单做老化重定价。",
+        "params_schema": {
+            "sell_reprice_enabled": {"type": "boolean", "default": True, "label": "启用挂单重定价"},
+            "sell_reprice_min_drop_pct": {"type": "number", "min": 0, "max": 100, "default": 5, "label": "降价重挂阈值(%)"},
+            "sell_reprice_max_age_hours": {"type": "number", "min": 0, "default": 72, "label": "挂单老化小时数"},
+            "sell_reprice_min_interval_hours": {"type": "number", "min": 0, "default": 6, "label": "重挂最小间隔(小时)"},
+        },
     },
 }
 
@@ -369,6 +395,7 @@ SYSTEM_STRATEGIES: List[Dict[str, Any]] = [
             {"module_id": "guard.max_listings_per_item", "enabled": True, "params": {}},
             {"module_id": "pricing.steam_wall_price", "enabled": True, "params": {}},
             {"module_id": "pricing.price_offset", "enabled": True, "params": {}},
+            {"module_id": "guard.sell_cost_floor", "enabled": True, "params": {}},
             {"module_id": "action.steam_list", "enabled": True, "params": {}},
         ],
     },
@@ -385,6 +412,7 @@ SYSTEM_STRATEGIES: List[Dict[str, Any]] = [
             {"module_id": "pricing.steam_wall_price", "enabled": True, "params": {}},
             {"module_id": "pricing.price_offset", "enabled": True, "params": {}},
             {"module_id": "guard.rising_trend_wait", "enabled": True, "params": {}},
+            {"module_id": "guard.sell_cost_floor", "enabled": True, "params": {}},
             {"module_id": "action.steam_list", "enabled": True, "params": {}},
         ],
     },
@@ -402,6 +430,7 @@ SYSTEM_STRATEGIES: List[Dict[str, Any]] = [
             {"module_id": "pricing.price_offset", "enabled": True, "params": {}},
             {"module_id": "guard.rising_trend_wait", "enabled": True, "params": {}},
             {"module_id": "guard.profit_ratio", "enabled": True, "params": {}},
+            {"module_id": "guard.sell_cost_floor", "enabled": True, "params": {}},
             {"module_id": "action.steam_list", "enabled": True, "params": {}},
         ],
     },
@@ -1346,19 +1375,37 @@ def _current_param_values(config: dict) -> Dict[str, Dict[str, Any]]:
         },
         "guard.held_same_item_guard": {},
         "guard.target_balance": {"target_balance": pipe.get("target_balance")},
-        "guard.max_listings_per_item": {"max_listings_per_item": pipe.get("max_listings_per_item")},
+        "guard.max_listings_per_item": {
+            "max_listings_per_item": pipe.get("max_listings_per_item"),
+            "sell_liquidity_ratio": pipe.get("sell_liquidity_ratio"),
+        },
+        "guard.sell_cost_floor": {"sell_cost_floor_ratio": pipe.get("sell_cost_floor_ratio")},
         "pricing.steam_wall_gap": {
             "sell_price_wall_volume": pipe.get("sell_price_wall_volume"),
             "sell_price_max_ignore_volume": pipe.get("sell_price_max_ignore_volume"),
+            "sell_price_min_tier_volume": pipe.get("sell_price_min_tier_volume"),
+            "sell_price_max_ratio": pipe.get("sell_price_max_ratio"),
+            "sell_anchor_max_ratio": pipe.get("sell_anchor_max_ratio"),
+            "sell_anchor_days": pipe.get("sell_anchor_days"),
             "sell_price_offset": pipe.get("sell_price_offset"),
         },
         "pricing.steam_wall_price": {
             "sell_price_wall_volume": pipe.get("sell_price_wall_volume"),
             "sell_price_max_ignore_volume": pipe.get("sell_price_max_ignore_volume"),
+            "sell_price_min_tier_volume": pipe.get("sell_price_min_tier_volume"),
+            "sell_price_max_ratio": pipe.get("sell_price_max_ratio"),
+            "sell_anchor_max_ratio": pipe.get("sell_anchor_max_ratio"),
+            "sell_anchor_days": pipe.get("sell_anchor_days"),
         },
         "pricing.price_offset": {"sell_price_offset": pipe.get("sell_price_offset")},
         "guard.rising_trend_wait": {"sell_trend_days": pipe.get("sell_trend_days")},
         "guard.profit_ratio": {"profit_ratio_multiplier": pipe.get("profit_ratio_multiplier", 1.05)},
+        "action.steam_list": {
+            "sell_reprice_enabled": pipe.get("sell_reprice_enabled"),
+            "sell_reprice_min_drop_pct": pipe.get("sell_reprice_min_drop_pct"),
+            "sell_reprice_max_age_hours": pipe.get("sell_reprice_max_age_hours"),
+            "sell_reprice_min_interval_hours": pipe.get("sell_reprice_min_interval_hours"),
+        },
     }
 
 
@@ -1496,9 +1543,11 @@ def apply_strategy_to_config(config: dict, strategy_type: str, strategy_override
     else:
         pipe["sell_strategy"] = _derive_sell_strategy_number(strategy)
         if "guard.max_listings_per_item" in enabled_ids:
-            params = _step_params(strategy, "guard.max_listings_per_item")
-            if "max_listings_per_item" in params:
-                pipe["max_listings_per_item"] = int(params.get("max_listings_per_item") or 5)
+            for key, val in _step_params(strategy, "guard.max_listings_per_item").items():
+                if key == "max_listings_per_item":
+                    pipe["max_listings_per_item"] = int(val or 5)
+                else:
+                    pipe[key] = val
         if "pricing.steam_wall_gap" in enabled_ids:
             for key, val in _step_params(strategy, "pricing.steam_wall_gap").items():
                 pipe[key] = val
@@ -1519,6 +1568,17 @@ def apply_strategy_to_config(config: dict, strategy_type: str, strategy_override
             params = _step_params(strategy, "guard.profit_ratio")
             if "profit_ratio_multiplier" in params:
                 pipe["profit_ratio_multiplier"] = float(params.get("profit_ratio_multiplier") or 1.05)
+        if "guard.sell_cost_floor" in enabled_ids:
+            params = _step_params(strategy, "guard.sell_cost_floor")
+            if "sell_cost_floor_ratio" in params:
+                pipe["sell_cost_floor_ratio"] = float(params.get("sell_cost_floor_ratio") or 1.0)
+            pipe["sell_cost_floor_enabled"] = True
+        else:
+            pipe["sell_cost_floor_enabled"] = False
+        if "action.steam_list" in enabled_ids:
+            for key, val in _step_params(strategy, "action.steam_list").items():
+                if val is not None:
+                    pipe[key] = val
     return cfg
 
 

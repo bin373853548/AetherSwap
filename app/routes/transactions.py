@@ -22,8 +22,8 @@ from app.config_loader import (
     load_app_config_validated,
 )
 from app.shared_market import get_steam_smart_price_cny, batch_fetch_prices
+from utils.money import STEAM_FEE_FACTOR
 router = APIRouter()
-STEAM_FEE_FACTOR = 1.15
 
 
 class AddPurchaseBody(BaseModel):

@@ -48,6 +48,8 @@ class Sale(SQLModel, table=True):
     price: float = 0.0
     at: float = 0.0
     assetid: Optional[str] = None
+    # "list" for a first-time listing, "reprice" for a delist+relist cycle.
+    kind: Optional[str] = None
 class ItemNameId(SQLModel, table=True):
     market_hash_name: str = Field(primary_key=True)
     item_nameid: str
@@ -131,6 +133,18 @@ def init_db() -> None:
         ("batch_id", "TEXT"),
         ("bill_order_id", "TEXT"),
     )
+    sale_columns = (("kind", "TEXT"),)
+    with engine.connect() as conn:
+        for column_name, column_type in sale_columns:
+            try:
+                conn.execute(
+                    sa_text(
+                        f"ALTER TABLE sale ADD COLUMN {column_name} {column_type}"
+                    )
+                )
+                conn.commit()
+            except Exception:
+                pass
     with engine.connect() as conn:
         for column_name, column_type in purchase_columns:
             try:
@@ -192,6 +206,7 @@ def _sale_from_dict(d: dict) -> Sale:
         price=float(d.get("price", 0)),
         at=float(d.get("at", 0)),
         assetid=str(d["assetid"]) if d.get("assetid") is not None else None,
+        kind=str(d["kind"]) if d.get("kind") else None,
     )
 def _purchase_to_dict(p: Purchase) -> dict:
     d = {
@@ -233,6 +248,8 @@ def _sale_to_dict(s: Sale) -> dict:
     }
     if s.assetid is not None:
         d["assetid"] = s.assetid
+    if s.kind is not None:
+        d["kind"] = s.kind
     return d
 def migrate_from_json() -> bool:
     """
@@ -270,7 +287,7 @@ _PURCHASE_UPDATABLE = frozenset({
     "sold_at", "pending_receipt", "assetid", "listing", "listing_status",
     "buff_order_id", "buff_sell_order_id", "batch_id", "bill_order_id",
 })
-_SALE_UPDATABLE = frozenset({"name", "price", "goods_id", "assetid", "at"})
+_SALE_UPDATABLE = frozenset({"name", "price", "goods_id", "assetid", "at", "kind"})
 def db_append_purchase(p: dict) -> None:
     with get_session() as session:
         session.add(_purchase_from_dict(p))

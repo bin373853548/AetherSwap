@@ -25,6 +25,7 @@ from app.services.buff_checkout_guard import (
 from app.services.buff_auth import get_buff_auth_lock
 from app.notify import send_pushplus, build_payment_notify_content, wait_email_command
 from utils.delay import jittered_sleep
+from utils.money import STEAM_FEE_FACTOR
 from buff import (
     BuffAuthExpired,
     BuffRequestBlocked,
@@ -32,7 +33,6 @@ from buff import (
     BuffWriteResultUnknown,
 )
 
-STEAM_FEE_FACTOR = 1.15  # Steam take rate for calculating net proceeds
 BUFF_ORDERS_CACHE_TTL_SECONDS = 3.0
 TIME_WINDOW_CLOSED = object()
 CURRENCY_QUANTUM = Decimal("0.01")
@@ -278,6 +278,8 @@ def _fetch_steam_sell_data(
         cfg = config.get("pipeline", {})
         wall_volume = int(cfg.get("sell_price_wall_volume", 20))
         max_ignore = int(cfg.get("sell_price_max_ignore_volume", 4))
+        min_tier_volume = max(0, int(cfg.get("sell_price_min_tier_volume", 3) or 0))
+        max_price_ratio = cfg.get("sell_price_max_ratio")
         usd_to_cny_rate = float(cfg.get("usd_to_cny", 7.2))
         orders_result = get_sell_orders_cny(
             session,
@@ -300,6 +302,8 @@ def _fetch_steam_sell_data(
             orders,
             wall_volume_threshold=wall_volume,
             max_ignore_volume=max_ignore,
+            min_lowest_tier_volume=min_tier_volume,
+            max_price_ratio=max_price_ratio,
             min_step=0,
             offset=0,
         )

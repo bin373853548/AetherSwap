@@ -1,5 +1,6 @@
 import json
 import re
+import statistics
 import threading
 import time
 from collections import defaultdict
@@ -16,13 +17,14 @@ from app.services.account_region import refresh_account_region_currency
 from app.strategy_engine import apply_strategy_to_config, evaluate_strategy_runtime_modules
 from app.state import get_state, append_sale
 from app.steam_confirm import auto_confirm_once
+from app.steam_delist import delist_item
 from app.steam_listings import fetch_my_listings
 from steam.market import list_item, parse_sell_response
 from steam.market_orders import compute_smart_list_price, get_sell_orders_cny
 from steam.request_policy import MarketCooldown
 from steam.session import create_market_session
 from utils.delay import jittered_sleep
-from utils.money import USD_TO_CNY_DEFAULT, list_price_display_to_cents
+from utils.money import STEAM_FEE_FACTOR, USD_TO_CNY_DEFAULT, list_price_display_to_cents
 from utils.time import parse_steam_history_date
 from utils.trend import calculate_trend_robust
 
@@ -33,17 +35,37 @@ _listing_cooldown = MarketCooldown()
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _steam_latest_price_and_trend(market_hash_name: str, trend_days: int = 7):
+_EMPTY_HISTORY_SIGNALS = {
+    "latest_price": None,
+    "trend": None,
+    "median_price": None,
+    "anchor_price": None,
+    "daily_volume": 0.0,
+    "sample_size": 0,
+}
+_ANCHOR_MIN_TRADES = 3
+
+
+def _steam_history_signals(market_hash_name: str, window_days: int = 7, anchor_days: int = 3) -> dict:
+    """Summarise Steam sale history for pricing.
+
+    Returns ``latest_price``/``trend``, the ``median_price`` of the most recent
+    *anchor_days* of trades, the ``anchor_price`` used as the pricing ceiling
+    (the higher of that median and the latest trade, so a rally is not capped by
+    a stale median), and the average ``daily_volume`` over *window_days*.
+    Everything degrades to None/0 when the history is unavailable so callers
+    never have to special-case a failed fetch.
+    """
     from app.services.steam_client import SteamClient
     from utils.money import apply_currency
     client = SteamClient()
     raw = client.fetch_history(market_hash_name, app_id=730, return_currency=True)
     if not raw or not isinstance(raw, dict):
-        return None, None, None
+        return dict(_EMPTY_HISTORY_SIGNALS)
     history = raw.get("history")
     currency = raw.get("currency")
     if not history:
-        return None, None, None
+        return dict(_EMPTY_HISTORY_SIGNALS)
     parsed = []
     for entry in history:
         if len(entry) < 2:
@@ -52,25 +74,46 @@ def _steam_latest_price_and_trend(market_hash_name: str, trend_days: int = 7):
         if dt is None:
             continue
         try:
-            p = float(entry[1])
+            price = float(entry[1])
         except (ValueError, TypeError):
             continue
-        parsed.append((dt, p))
+        try:
+            volume = float(entry[2]) if len(entry) > 2 and entry[2] is not None else 0.0
+        except (ValueError, TypeError):
+            volume = 0.0
+        parsed.append((dt, price, volume))
     if not parsed:
-        return None, None, None
-    prices = [p for (_, p) in parsed]
-    prices_cny, _ = apply_currency(prices, currency, USD_TO_CNY_DEFAULT)
+        return dict(_EMPTY_HISTORY_SIGNALS)
+    prices_cny, _ = apply_currency([x[1] for x in parsed], currency, USD_TO_CNY_DEFAULT)
     if not prices_cny:
-        return None, None, None
-    parsed_cny = list(zip([x[0] for x in parsed], prices_cny))
-    parsed_cny.sort(key=lambda x: x[0])
-    latest_price = parsed_cny[-1][1]
-    newest_dt = parsed_cny[-1][0]
-    cutoff = newest_dt - timedelta(days=trend_days)
-    in_range = [(dt, p) for dt, p in parsed_cny if dt >= cutoff]
-    prices_in_range = [p for (_, p) in in_range]
-    trend = calculate_trend_robust(prices_in_range, use_dynamic_sensitivity=True) if len(prices_in_range) >= 3 else 0
-    return latest_price, trend, prices_in_range
+        return dict(_EMPTY_HISTORY_SIGNALS)
+    rows = sorted(
+        zip([x[0] for x in parsed], prices_cny, [x[2] for x in parsed]),
+        key=lambda x: x[0],
+    )
+    newest_dt = rows[-1][0]
+    window_days = max(1, int(window_days))
+    window_cutoff = newest_dt - timedelta(days=window_days)
+    window_rows = [r for r in rows if r[0] >= window_cutoff]
+    window_prices = [r[1] for r in window_rows]
+    trend = (
+        calculate_trend_robust(window_prices, use_dynamic_sensitivity=True)
+        if len(window_prices) >= 3
+        else 0
+    )
+    total_volume = sum(r[2] for r in window_rows)
+    anchor_cutoff = newest_dt - timedelta(days=max(1, int(anchor_days)))
+    anchor_prices = [r[1] for r in rows if r[0] >= anchor_cutoff]
+    latest_price = rows[-1][1]
+    median_price = statistics.median(anchor_prices) if len(anchor_prices) >= _ANCHOR_MIN_TRADES else None
+    return {
+        "latest_price": latest_price,
+        "trend": trend,
+        "median_price": median_price,
+        "anchor_price": max(median_price, latest_price) if median_price is not None else None,
+        "daily_volume": total_volume / window_days,
+        "sample_size": len(window_prices),
+    }
 
 
 def _load_rate_map() -> dict:
@@ -87,9 +130,19 @@ def _load_rate_map() -> dict:
     return {}
 
 
-def _record_listing_success(ctx, aid: str, name: str, list_price: float, listing_delay: float) -> None:
+def _record_listing_success(
+    ctx,
+    aid: str,
+    name: str,
+    list_price: float,
+    listing_delay: float,
+    kind: str = "list",
+) -> None:
     """Append sale record, mark purchase as listed, and sleep the listing delay."""
-    append_sale({"name": name, "goods_id": 0, "price": list_price, "at": time.time(), "assetid": aid or ""})
+    append_sale({
+        "name": name, "goods_id": 0, "price": list_price, "at": time.time(),
+        "assetid": aid or "", "kind": kind,
+    })
     if aid:
         purchases = ctx.state.get_purchases()
         for i, p in enumerate(purchases):
@@ -101,6 +154,179 @@ def _record_listing_success(ctx, aid: str, name: str, list_price: float, listing
                     ctx.state.update_purchase(i, {"listing": True})
                 break
     jittered_sleep(listing_delay)
+
+
+
+def _history_signals_cached(cache: dict, market_hash_name: str, window_days: int, anchor_days: int) -> dict:
+    """Return :func:`_steam_history_signals` for *market_hash_name*, memoised per round."""
+    if market_hash_name not in cache:
+        cache[market_hash_name] = _steam_history_signals(
+            market_hash_name, window_days=window_days, anchor_days=anchor_days
+        )
+    return cache[market_hash_name]
+
+
+def _cost_floor_breach(cost, list_price, floor_ratio):
+    """Return ``(net_proceeds, required_price)`` when *list_price* undercuts the cost floor.
+
+    ``net_proceeds`` approximates the seller's proceeds after the Steam fee and
+    ``required_price`` is the buyer-pays price that would just reach
+    ``cost × floor_ratio``.  ``None`` means the listing is acceptable.
+    """
+    try:
+        cost = float(cost or 0)
+        list_price = float(list_price or 0)
+        ratio = float(floor_ratio if floor_ratio is not None else 1.0)
+    except (TypeError, ValueError):
+        return None
+    if cost <= 0 or list_price <= 0 or ratio <= 0:
+        return None
+    net_proceeds = list_price / STEAM_FEE_FACTOR
+    if net_proceeds >= cost * ratio:
+        return None
+    return net_proceeds, round(cost * ratio * STEAM_FEE_FACTOR, 2)
+
+
+def _pricing_params(pipeline_cfg: dict) -> dict:
+    """Read the shared Steam smart-pricing parameters from pipeline config."""
+    return {
+        "wall_volume": int(pipeline_cfg.get("sell_price_wall_volume", 20)),
+        "max_ignore": int(pipeline_cfg.get("sell_price_max_ignore_volume", 4)),
+        "min_tier_volume": max(0, int(pipeline_cfg.get("sell_price_min_tier_volume", 3) or 0)),
+        "max_price_ratio": pipeline_cfg.get("sell_price_max_ratio"),
+        "sell_offset": float(pipeline_cfg.get("sell_price_offset", 0)),
+        "anchor_max_ratio": pipeline_cfg.get("sell_anchor_max_ratio"),
+        "anchor_days": int(pipeline_cfg.get("sell_anchor_days", 3) or 3),
+        "liquidity_ratio": float(pipeline_cfg.get("sell_liquidity_ratio", 0) or 0),
+    }
+
+
+def _fetch_steam_target_price(
+    session,
+    market_hash_name: str,
+    appid: int,
+    params: dict,
+    recent_sale_price: Optional[float] = None,
+    anchor_max_ratio: Optional[float] = None,
+):
+    """Fetch Steam sell orders and compute the target listing price (CNY).
+
+    Returns ``(list_price, reason, orders_data, error)``.  ``orders_data`` is
+    ``None`` when the order book could not be read and ``error`` then explains
+    why.
+    """
+    try:
+        orders_result = get_sell_orders_cny(
+            session,
+            market_hash_name,
+            app_id=appid,
+            return_error=True,
+        )
+        if isinstance(orders_result, tuple) and len(orders_result) == 2:
+            orders_data, orders_error = orders_result
+        else:
+            orders_data, orders_error = orders_result, None
+    except Exception as e:
+        return None, "", None, f"拉取卖单异常: {type(e).__name__} - {e}"
+    if not orders_data or not orders_data.get("sell_orders"):
+        return None, "", None, f"无法获取 Steam 卖单：{orders_error or '未知原因'}"
+    list_price, reason = compute_smart_list_price(
+        orders_data["sell_orders"],
+        wall_volume_threshold=params["wall_volume"],
+        max_ignore_volume=params["max_ignore"],
+        min_lowest_tier_volume=params["min_tier_volume"],
+        max_price_ratio=params["max_price_ratio"],
+        offset=params["sell_offset"],
+        recent_sale_price=recent_sale_price,
+        anchor_max_ratio=anchor_max_ratio,
+    )
+    return list_price, reason, orders_data, None
+
+
+def _latest_listing_records(sales_snapshot: list) -> dict:
+    """Map each asset id to its newest listing record.
+
+    ``_record_listing_success`` appends one row per successful listing, so the
+    newest row carries the price (CNY) and time that item currently sits at.
+    """
+    latest: dict = {}
+    for row in sales_snapshot or []:
+        aid = str(row.get("assetid") or "").strip()
+        if not aid:
+            continue
+        prev = latest.get(aid)
+        if prev is None or float(row.get("at") or 0) > float(prev.get("at") or 0):
+            latest[aid] = row
+    return latest
+
+
+def _should_reprice(
+    current_price,
+    target_price,
+    age_hours,
+    min_drop_pct: float,
+    max_age_hours: float,
+    min_interval_hours: float,
+    record_kind: Optional[str] = None,
+):
+    """Decide whether a live listing should be delisted and relisted.
+
+    Returns a human-readable reason, or ``None`` to keep the listing as is.
+    """
+    try:
+        current_price = float(current_price)
+        target_price = float(target_price)
+    except (TypeError, ValueError):
+        return None
+    if current_price <= 0 or target_price <= 0:
+        return None
+    if (
+        min_interval_hours > 0
+        and record_kind == "reprice"
+        and age_hours is not None
+        and age_hours < min_interval_hours
+    ):
+        return None
+    drop_pct = (current_price - target_price) / current_price * 100
+    if drop_pct >= min_drop_pct:
+        return f"新价低于现价 {drop_pct:.1f}%"
+    if age_hours is not None and age_hours >= max_age_hours:
+        change_pct = abs(target_price - current_price) / current_price * 100
+        if change_pct >= 1.0:
+            direction = "低于" if target_price < current_price else "高于"
+            return f"挂单已 {age_hours:.0f} 小时且新价{direction}现价 {change_pct:.1f}%"
+    return None
+
+
+def _update_purchase_for_assetid(ctx: PipelineContext, aid: str, data: dict) -> bool:
+    """Apply *data* to the purchase record owning *aid*; returns whether it exists."""
+    aid = str(aid or "").strip()
+    if not aid:
+        return False
+    for i, p in enumerate(ctx.state.get_purchases()):
+        if str(p.get("assetid") or "").strip() != aid:
+            continue
+        db_id = p.get("_db_id")
+        if db_id:
+            ctx.state.update_purchase_by_id(db_id, data)
+        else:
+            ctx.state.update_purchase(i, data)
+        return True
+    return False
+
+
+def _rebind_purchase_assetid(ctx: PipelineContext, old_aid: str, new_aid: Optional[str]) -> None:
+    """Re-point the purchase record from *old_aid* to *new_aid* and clear listing flags.
+
+    ``new_aid`` may be ``None`` when Steam rotated the asset id but the new one
+    could not be read; the stored asset id is then cleared so the next
+    inventory/sold sync can refill it by name instead of keeping a dead id.
+    """
+    _update_purchase_for_assetid(ctx, old_aid, {
+        "assetid": new_aid,
+        "listing": False,
+        "listing_status": None,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -173,16 +399,32 @@ def _build_listing_plan(
 
     Returns a list of dicts ready for ``_submit_listings``.
     """
-    wall_volume = int(pipeline_cfg.get("sell_price_wall_volume", 20))
-    max_ignore = int(pipeline_cfg.get("sell_price_max_ignore_volume", 4))
+    params = _pricing_params(pipeline_cfg)
+    min_tier_volume = params["min_tier_volume"]
+    max_price_ratio = params["max_price_ratio"]
+    sell_offset = params["sell_offset"]
     max_per_item = max(1, int(pipeline_cfg.get("max_listings_per_item", 5) or 5))
-    sell_offset = float(pipeline_cfg.get("sell_price_offset", 0))
     trend_days = int(pipeline_cfg.get("sell_trend_days", 7))
+    cost_floor_enabled = bool(pipeline_cfg.get("sell_cost_floor_enabled", True))
+    try:
+        cost_floor_ratio = float(pipeline_cfg.get("sell_cost_floor_ratio", 1.0))
+    except (TypeError, ValueError):
+        cost_floor_ratio = 1.0
+    anchor_max_ratio = params["anchor_max_ratio"]
+    anchor_days = params["anchor_days"]
+    liquidity_ratio = params["liquidity_ratio"]
+    try:
+        anchor_enabled = float(anchor_max_ratio) > 0
+    except (TypeError, ValueError):
+        anchor_enabled = False
+    need_history = bool(anchor_enabled or liquidity_ratio > 0 or sell_strategy in (2, 3))
 
     to_list_by_name: dict = defaultdict(int)
     skip_same_name_cap: dict = defaultdict(int)
+    skip_liquidity_cap: dict = defaultdict(int)
     to_list = []
     seen_assetids: set = set()
+    history_cache: dict = {}
 
     for it in sellable:
         if ctx.is_stop_requested():
@@ -198,6 +440,12 @@ def _build_listing_plan(
         seen_assetids.add(aid)
         if not market_hash_name:
             ctx.log(f"[出售] 跳过无名物品 assetid={aid}", "info", category="steam")
+            continue
+        if ok_listings and aid in active_listing_ids:
+            ctx.log(
+                f"[出售] {name} assetid={aid} 已在 Steam 在售列表中，跳过重复上架",
+                "info", category="steam",
+            )
             continue
         
         buy_record = _find_buy_record(purchases_snapshot, aid, market_hash_name)
@@ -227,35 +475,42 @@ def _build_listing_plan(
             skip_same_name_cap[market_hash_name] += 1
             continue
 
-        try:
-            orders_result = get_sell_orders_cny(
-                session,
-                market_hash_name,
-                app_id=int(it.get("appid", 730)),
-                return_error=True,
-            )
-            if isinstance(orders_result, tuple) and len(orders_result) == 2:
-                orders_data, orders_error = orders_result
-            else:
-                orders_data, orders_error = orders_result, None
-        except Exception as e:
-            ctx.log(f"[出售] {name} assetid={aid} 拉取卖单异常: {type(e).__name__} - {e}", "error", category="steam")
-            continue
-        if not orders_data or not orders_data.get("sell_orders"):
-            ctx.log(f"[出售] {name} assetid={aid} 无法获取 Steam 卖单：{orders_error or '未知原因'}，跳过", "warn", category="steam")
-            continue
-
-        list_price, reason = compute_smart_list_price(
-            orders_data["sell_orders"],
-            wall_volume_threshold=wall_volume,
-            max_ignore_volume=max_ignore,
-            offset=sell_offset,
+        signals = (
+            _history_signals_cached(history_cache, market_hash_name, trend_days, anchor_days)
+            if need_history
+            else dict(_EMPTY_HISTORY_SIGNALS)
         )
+        liquidity_output = {}
+        if liquidity_ratio > 0 and signals["daily_volume"] > 0:
+            liquidity_cap = max(1, int(signals["daily_volume"] * liquidity_ratio))
+            if steam_same_name + already_in_this_round >= liquidity_cap:
+                skip_liquidity_cap[market_hash_name] += 1
+                ctx.log(
+                    f"[出售] {name} assetid={aid} 卖出侧流动性限制：日成交约 {signals['daily_volume']:.1f} 件 × "
+                    f"{liquidity_ratio:g} 最多在售 {liquidity_cap} 件（已 {steam_same_name}），跳过",
+                    "info", category="steam",
+                )
+                continue
+            liquidity_output = {
+                "daily_volume": round(signals["daily_volume"], 2),
+                "ratio": liquidity_ratio,
+                "cap": liquidity_cap,
+            }
+
+        list_price, reason, orders_data, orders_error = _fetch_steam_target_price(
+            session, market_hash_name, int(it.get("appid", 730)), params,
+            recent_sale_price=signals["anchor_price"],
+            anchor_max_ratio=anchor_max_ratio,
+        )
+        if orders_data is None:
+            level = "error" if "异常" in (orders_error or "") else "warn"
+            ctx.log(f"[出售] {name} assetid={aid} {orders_error}，跳过", level, category="steam")
+            continue
         if list_price is None or list_price <= 0:
             ctx.log(f"[出售] {name} assetid={aid} 无法计算定价({reason})，跳过", "warn", category="steam")
             continue
         list_price = round(float(list_price), 2)
-        trend = None
+        trend = signals["trend"] if need_history else None
         profit_output = {}
 
         # Currency conversion for display
@@ -277,11 +532,9 @@ def _build_listing_plan(
             )
 
         # Sell strategy 2/3: skip if rising trend
-        if sell_strategy in (2, 3):
-            _, trend, _ = _steam_latest_price_and_trend(market_hash_name, trend_days=trend_days)
-            if trend is not None and trend > 0:
-                ctx.log(f"[出售] {name} assetid={aid} 近{trend_days}天上升趋势，等待", "info", category="steam")
-                continue
+        if sell_strategy in (2, 3) and trend is not None and trend > 0:
+            ctx.log(f"[出售] {name} assetid={aid} 近{trend_days}天上升趋势，等待", "info", category="steam")
+            continue
 
         # Sell strategy 3: ratio guard
         if sell_strategy == 3:
@@ -311,7 +564,28 @@ def _build_listing_plan(
                         "info", category="steam",
                     )
 
+        # Cost floor: never list below what the item cost us (plus margin).
+        cost_floor_output = {}
+        if cost_floor_enabled and buy_record:
+            breach = _cost_floor_breach(buy_record.get("price"), list_price, cost_floor_ratio)
+            if breach is not None:
+                net_proceeds, required_price = breach
+                cost_floor_output = {
+                    "cost": float(buy_record.get("price") or 0),
+                    "net_proceeds": round(net_proceeds, 2),
+                    "required_price": required_price,
+                    "ratio": cost_floor_ratio,
+                }
+                ctx.log(
+                    f"[出售] {name} assetid={aid} 触及成本底线：挂价 {list_price:.2f} 到手约 "
+                    f"{net_proceeds:.2f} 低于成本×{cost_floor_ratio:g}，需 {required_price:.2f}，跳过等待回升",
+                    "info", category="steam",
+                )
+                continue
+
         custom_outputs = {
+            "guard.sell_cost_floor": cost_floor_output,
+            "guard.sell_liquidity_cap": liquidity_output,
             "guard.max_listings_per_item": {
                 "steam_same_name": steam_same_name,
                 "round_same_name": already_in_this_round,
@@ -321,13 +595,25 @@ def _build_listing_plan(
                 "list_price": list_price,
                 "reason": reason,
                 "order_count": len(orders_data.get("sell_orders") or []),
+                "min_lowest_tier_volume": min_tier_volume,
+                "max_price_ratio": max_price_ratio,
+                "anchor_price": signals["anchor_price"],
+                "anchor_max_ratio": anchor_max_ratio,
             },
             "pricing.steam_wall_gap": {
                 "list_price": list_price,
                 "reason": reason,
                 "order_count": len(orders_data.get("sell_orders") or []),
+                "min_lowest_tier_volume": min_tier_volume,
+                "max_price_ratio": max_price_ratio,
+                "anchor_price": signals["anchor_price"],
+                "anchor_max_ratio": anchor_max_ratio,
             },
             "pricing.price_offset": {"sell_price_offset": sell_offset},
+            "pricing.price_ceiling": {
+                "min_lowest_tier_volume": min_tier_volume,
+                "max_price_ratio": max_price_ratio,
+            },
             "guard.rising_trend_wait": {"trend": trend, "trend_days": trend_days},
             "guard.profit_ratio": profit_output,
         }
@@ -375,6 +661,13 @@ def _build_listing_plan(
         if len(skip_same_name_cap) > 5:
             parts.append(f"等共 {len(skip_same_name_cap)} 种")
         ctx.log(f"[出售] 同名在售已达上限跳过 共 {total_skip} 件（{', '.join(parts)}）", "info", category="steam")
+
+    if skip_liquidity_cap:
+        total_skip = sum(skip_liquidity_cap.values())
+        parts = [f"{n} x{c}" for n, c in sorted(skip_liquidity_cap.items(), key=lambda x: -x[1])[:5]]
+        if len(skip_liquidity_cap) > 5:
+            parts.append(f"等共 {len(skip_liquidity_cap)} 种")
+        ctx.log(f"[出售] 卖出侧流动性限制跳过 共 {total_skip} 件（{', '.join(parts)}）", "info", category="steam")
 
     return to_list
 
@@ -556,6 +849,11 @@ def _submit_listings(
 
             if _listing_response_is_success(out, data, msg):
                 listed += 1
+                if "already have a listing" in msg_lower:
+                    ctx.log(
+                        f"[出售] {name} assetid={aid} Steam 提示已存在挂单，价格 {list_price:.2f} 可能未生效，请在售列表核对",
+                        "warn", category="steam",
+                    )
                 ctx.log(f"[出售] 已上架 assetid={aid} {name} 价格={list_price:.2f} ({reason})", "info", category="steam")
                 _record_listing_success(ctx, aid, name, list_price, listing_delay)
                 continue
@@ -596,16 +894,20 @@ def _submit_listings(
     return listed
 
 
-def _auto_confirm_listings(ctx: PipelineContext, cfg: dict, steam_id: str, cookies: str) -> None:
-    """Confirm pending Steam Guard confirmations after listing, if configured."""
+def _auto_confirm_listings(ctx: PipelineContext, cfg: dict, steam_id: str, cookies: str) -> bool:
+    """Confirm pending Steam Guard confirmations after listing, if configured.
+
+    Returns ``True`` when confirmations were processed, meaning a freshly
+    created listing should be visible on Steam right away.
+    """
     steam_confirm_cfg = cfg.get("steam_confirm") or {}
     if not bool(steam_confirm_cfg.get("enabled")):
-        return
+        return False
     identity_secret = (steam_confirm_cfg.get("identity_secret") or "").strip()
     device_id = (steam_confirm_cfg.get("device_id") or "").strip()
     if not identity_secret or not device_id:
         ctx.log("[确认] 已开启自动确认，但 identity_secret/device_id 未配置，跳过", "warn", category="steam")
-        return
+        return False
     jittered_sleep(2)
     ctx.log("[确认] 正在检查待确认列表…", "info", category="steam")
     okc, n, errc = auto_confirm_once(
@@ -616,8 +918,346 @@ def _auto_confirm_listings(ctx: PipelineContext, cfg: dict, steam_id: str, cooki
     )
     if okc:
         ctx.log(f"[确认] 已自动确认 {n} 项", "info", category="steam")
-    else:
-        ctx.log(f"[确认] 自动确认失败: {errc}", "warn", category="steam")
+        return True
+    ctx.log(f"[确认] 自动确认失败: {errc}", "warn", category="steam")
+    return False
+
+
+def _build_repricing_plan(
+    ctx: PipelineContext,
+    cfg: dict,
+    session,
+    pipeline_cfg: dict,
+    purchases_snapshot: list,
+    sales_snapshot: list,
+    active_listing_ids: set,
+    listing_assetid_to_name: dict,
+    account_currency: str,
+    rate_map: dict,
+) -> list:
+    """Decide which currently listed items should be delisted and relisted.
+
+    Only listings whose current price and age can be traced back to a local
+    listing record are considered; anything else is left untouched.
+    """
+    if not bool(pipeline_cfg.get("sell_reprice_enabled", True)):
+        return []
+    min_drop_pct = float(pipeline_cfg.get("sell_reprice_min_drop_pct", 5) or 0)
+    max_age_hours = float(pipeline_cfg.get("sell_reprice_max_age_hours", 72) or 0)
+    min_interval_hours = float(pipeline_cfg.get("sell_reprice_min_interval_hours", 6) or 0)
+    cost_floor_enabled = bool(pipeline_cfg.get("sell_cost_floor_enabled", True))
+    try:
+        cost_floor_ratio = float(pipeline_cfg.get("sell_cost_floor_ratio", 1.0))
+    except (TypeError, ValueError):
+        cost_floor_ratio = 1.0
+    params = _pricing_params(pipeline_cfg)
+    trend_days = int(pipeline_cfg.get("sell_trend_days", 7))
+    anchor_max_ratio = params["anchor_max_ratio"]
+    anchor_days = params["anchor_days"]
+    try:
+        anchor_enabled = float(anchor_max_ratio) > 0
+    except (TypeError, ValueError):
+        anchor_enabled = False
+    history_cache: dict = {}
+
+    owned_by_assetid: dict = {}
+    for p in purchases_snapshot:
+        aid = str(p.get("assetid") or "").strip()
+        if not aid:
+            continue
+        try:
+            if float(p.get("sale_price") or 0) > 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if p.get("sold_at") not in (None, "", 0, 0.0):
+            continue
+        owned_by_assetid[aid] = p
+
+    latest_by_assetid = _latest_listing_records(sales_snapshot)
+    now = time.time()
+    to_reprice = []
+    for raw_aid in sorted(str(x or "").strip() for x in (active_listing_ids or set())):
+        aid = raw_aid
+        if not aid or aid not in owned_by_assetid:
+            continue
+        purchase = owned_by_assetid[aid]
+        name = (purchase.get("name") or "").strip()
+        market_hash_name = (
+            listing_assetid_to_name.get(aid)
+            or purchase.get("market_hash_name")
+            or name
+        ).strip()
+        if not market_hash_name:
+            continue
+        record = latest_by_assetid.get(aid)
+        if not record:
+            continue
+        try:
+            current_price = float(record.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        listed_at = float(record.get("at") or 0)
+        age_hours = (now - listed_at) / 3600 if listed_at > 0 else None
+        record_kind = str(record.get("kind") or "list")
+        if (
+            min_interval_hours > 0
+            and record_kind == "reprice"
+            and age_hours is not None
+            and age_hours < min_interval_hours
+        ):
+            ctx.debug(f"[重挂] {name} assetid={aid} 距上次重挂不足 {min_interval_hours:g} 小时，跳过", category="steam")
+            continue
+
+        recent_sale_price = None
+        if anchor_enabled:
+            recent_sale_price = _history_signals_cached(
+                history_cache, market_hash_name, trend_days, anchor_days
+            )["anchor_price"]
+        target_price, price_reason, orders_data, orders_error = _fetch_steam_target_price(
+            session, market_hash_name, int(purchase.get("appid", 730) or 730), params,
+            recent_sale_price=recent_sale_price,
+            anchor_max_ratio=anchor_max_ratio,
+        )
+        if orders_data is None:
+            ctx.debug(f"[重挂] {name} assetid={aid} {orders_error}，保持现状", category="steam")
+            continue
+        if target_price is None or float(target_price) <= 0:
+            ctx.debug(f"[重挂] {name} assetid={aid} 无法计算定价({price_reason})，保持现状", category="steam")
+            continue
+        target_price = round(float(target_price), 2)
+
+        reprice_reason = _should_reprice(
+            current_price, target_price, age_hours,
+            min_drop_pct, max_age_hours, min_interval_hours, record_kind,
+        )
+        if not reprice_reason:
+            continue
+
+        if cost_floor_enabled:
+            breach = _cost_floor_breach(purchase.get("price"), target_price, cost_floor_ratio)
+            if breach is not None:
+                net_proceeds, _required = breach
+                ctx.log(
+                    f"[重挂] {name} assetid={aid} 触及成本底线：新价 {target_price:.2f} 到手约 "
+                    f"{net_proceeds:.2f} 低于成本×{cost_floor_ratio:g}，保留现价",
+                    "info", category="steam",
+                )
+                continue
+
+        display_price = target_price
+        if account_currency != "CNY":
+            rate = rate_map.get(account_currency)
+            if not rate:
+                ctx.log(
+                    f"[重挂] {name} assetid={aid} 账号币种={account_currency} 缺少汇率，跳过重挂",
+                    "error", category="steam",
+                )
+                continue
+            display_price = round(target_price / rate, 2)
+
+        to_reprice.append({
+            "aid": aid,
+            "name": name,
+            "market_hash_name": market_hash_name,
+            "appid": int(purchase.get("appid", 730) or 730),
+            "contextid": str(purchase.get("contextid") or "2"),
+            "list_price": target_price,
+            "old_price": current_price,
+            "age_hours": age_hours,
+            "price_cents": list_price_display_to_cents(display_price, account_currency),
+            "reason": reprice_reason,
+        })
+        ctx.log(
+            f"[重挂] {name} assetid={aid} 现价={current_price:.2f} 新价={target_price:.2f}（{reprice_reason}）",
+            "info", category="steam",
+        )
+    return to_reprice
+
+
+def _reprice_listings(
+    ctx: PipelineContext,
+    entries: list,
+    session,
+    session_id_effective: str,
+    listing_delay: float,
+) -> int:
+    """Delist and relist the given entries, returning how many were relisted."""
+    remaining = _listing_cooldown.remaining()
+    if remaining > 0:
+        ctx.log(f"[重挂] 上架接口冷却中，约 {remaining:.0f}s 后可重试，本轮未重挂", "warn", category="steam")
+        return 0
+    repriced = 0
+    for entry in entries:
+        if ctx.is_stop_requested():
+            ctx.set_status("stopped", "已停止")
+            return repriced
+
+        aid = entry["aid"]
+        name = entry["name"]
+        list_price = entry["list_price"]
+        price_cents = entry["price_cents"]
+        reason = entry["reason"]
+        appid = int(entry.get("appid", 730))
+        contextid = str(entry.get("contextid") or "2")
+
+        ctx.log(f"[重挂] 下架旧挂单 {name} assetid={aid} 现价={entry['old_price']:.2f}", "info", category="steam")
+
+        def _log_fn(msg, level="info"):
+            ctx.log(f"[重挂] {msg}", level, category="steam")
+
+        try:
+            ok, new_assetid, err = delist_item(aid, name, log_fn=_log_fn)
+        except Exception as ex:
+            ctx.log(
+                f"[重挂] 下架异常 assetid={aid} {name}: {type(ex).__name__} - {_listing_response_body_preview(ex)}",
+                "error", category="steam",
+            )
+            continue
+        if not ok:
+            ctx.log(f"[重挂] 下架失败 assetid={aid} {name}: {err or '未知原因'}", "warn", category="steam")
+            continue
+        if err:
+            ctx.log(f"[重挂] 下架提示 assetid={aid} {name}: {err}", "warn", category="steam")
+
+        # 下架后 Steam 会分配新的 assetid，先本地解绑再以新 assetid 重新上架
+        _rebind_purchase_assetid(ctx, aid, new_assetid)
+        if not new_assetid:
+            ctx.log(
+                f"[重挂] 中止 {name}：已下架但未取得新 assetid，物品已回到库存；"
+                "本地资产号已清空，请用「同步售出/持有」补全后再上架",
+                "warn", category="steam",
+            )
+            continue
+
+        try:
+            out = list_item(session, session_id_effective, appid, contextid, new_assetid, price_cents)
+        except Exception as ex:
+            ctx.log(
+                f"[重挂] 上架异常 assetid={new_assetid} {name}: {type(ex).__name__} - {_listing_response_body_preview(ex)}",
+                "error", category="steam",
+            )
+            continue
+        if _listing_rate_limited(ctx, out):
+            break
+
+        data, response_error = _parse_listing_response(out)
+        if data is None:
+            ctx.log(f"[重挂] 上架响应异常 assetid={new_assetid} {name}: {response_error}", "warn", category="steam")
+            jittered_sleep(listing_delay)
+            continue
+
+        msg = _listing_response_message(data)
+        if _listing_response_is_success(out, data, msg):
+            repriced += 1
+            ctx.log(
+                f"[重挂] 成功 assetid={new_assetid} {name} 价格={list_price:.2f}（{reason}）",
+                "info", category="steam",
+            )
+            _record_listing_success(ctx, new_assetid, name, list_price, listing_delay, kind="reprice")
+            continue
+
+        ctx.log(
+            f"[重挂] 上架失败 assetid={new_assetid} {name}: {msg or _listing_response_body_preview(out.get('text'))}",
+            "warn", category="steam",
+        )
+        jittered_sleep(listing_delay)
+    return repriced
+
+
+def _reconcile_listings(
+    ctx: PipelineContext,
+    entries: list,
+    cookies: str,
+    auto_confirmed: bool,
+    debug_fn=None,
+) -> int:
+    """Verify that the listings we just recorded are actually live on Steam.
+
+    Returns the number of recorded listings that could not be found.  When
+    automatic confirmation ran the missing ones are marked as failed so the
+    next round retries them; otherwise they are only reported, because the
+    listing is most likely still waiting for a manual confirmation.
+    """
+    expected: dict = {}
+    for entry in entries or []:
+        aid = str((entry.get("it") or {}).get("assetid") or entry.get("aid") or "").strip()
+        if aid:
+            expected[aid] = entry
+    if not expected:
+        return 0
+
+    ok, active_ids, err, _names = fetch_my_listings(cookies, debug_fn=debug_fn)
+    if not ok:
+        ctx.log(f"[对账] 上架后核对失败: {err or '未知原因'}，跳过核对", "warn", category="steam")
+        return 0
+
+    purchases_by_assetid = {
+        str(p.get("assetid") or "").strip(): p
+        for p in ctx.state.get_purchases()
+        if str(p.get("assetid") or "").strip()
+    }
+    missing = []
+    for aid, entry in expected.items():
+        if aid in active_ids:
+            continue
+        record = purchases_by_assetid.get(aid)
+        if not record or not record.get("listing"):
+            # 该件本次并未成功上架（_submit_listings 已记录原因），无需对账
+            continue
+        missing.append(aid)
+
+    if not missing:
+        ctx.debug(f"[对账] 本轮 {len(expected)} 件均已在 Steam 在售列表中", category="steam")
+        return 0
+
+    for aid in missing:
+        entry = expected[aid]
+        name = entry.get("name") or ""
+        if auto_confirmed:
+            ctx.log(
+                f"[对账] {name} assetid={aid} 已记录上架但未出现在 Steam 在售列表，标记为异常待重试",
+                "warn", category="steam",
+            )
+            _update_purchase_for_assetid(ctx, aid, {"listing": False, "listing_status": "error"})
+        else:
+            ctx.log(
+                f"[对账] {name} assetid={aid} 未出现在 Steam 在售列表，可能仍待手动确认，请核对",
+                "warn", category="steam",
+            )
+    return len(missing)
+
+
+def _run_reprice_phase(
+    ctx: PipelineContext,
+    cfg: dict,
+    session,
+    session_id_effective: str,
+    pipeline_cfg: dict,
+    purchases_snapshot: list,
+    ok_listings: bool,
+    active_listing_ids: set,
+    listing_assetid_to_name: dict,
+    account_currency: str,
+    rate_map: dict,
+    listing_delay: float,
+) -> int:
+    """Reprice stale or overpriced live listings; returns how many were relisted."""
+    if not ok_listings or not active_listing_ids:
+        return 0
+    to_reprice = _build_repricing_plan(
+        ctx, cfg, session, pipeline_cfg, purchases_snapshot, ctx.state.get_sales(),
+        active_listing_ids, listing_assetid_to_name, account_currency, rate_map,
+    )
+    if not to_reprice:
+        return 0
+    if not bool((cfg.get("steam_confirm") or {}).get("enabled")):
+        ctx.log("[重挂] 未开启自动确认：重挂后请在 Steam 手机端确认新的上架请求", "warn", category="steam")
+    ctx.log(f"[重挂] 开始重挂 {len(to_reprice)} 件", "info", category="steam")
+    repriced = _reprice_listings(ctx, to_reprice, session, session_id_effective, listing_delay)
+    if repriced:
+        ctx.log(f"[重挂] 本轮重挂完成 {repriced} 件", "info", category="steam")
+    return repriced
 
 
 # ---------------------------------------------------------------------------
@@ -721,16 +1361,31 @@ def _run_sell_phase_impl(cfg: dict, state, flow_id: str, items: Optional[list] =
         listing_assetid_to_name, assetid_to_name_map, account_currency, rate_map,
     )
 
-    if not to_list:
+    listed = 0
+    if to_list:
+        ctx.log(f"[出售] 开始上架 {len(to_list)} 件", "info", category="steam")
+        listed = _submit_listings(ctx, to_list, session, session_id_effective, listing_delay)
+        if listed:
+            ctx.log(f"[出售] 本轮回共上架 {listed} 件，等待下一轮", "info", category="steam")
+    else:
         ctx.debug("[出售] 本轮回无需上架", category="steam")
-        return
 
-    ctx.log(f"[出售] 开始上架 {len(to_list)} 件", "info", category="steam")
-    listed = _submit_listings(ctx, to_list, session, session_id_effective, listing_delay)
+    repriced = _run_reprice_phase(
+        ctx, cfg, session, session_id_effective, pipeline_cfg,
+        purchases_snapshot, ok_listings, active_listing_ids,
+        listing_assetid_to_name, account_currency, rate_map, listing_delay,
+    )
 
-    if listed:
-        ctx.log(f"[出售] 本轮回共上架 {listed} 件，等待下一轮", "info", category="steam")
-        _auto_confirm_listings(ctx, cfg, cred_steam.get("steam_id", ""), cred_steam.get("cookies", ""))
+    auto_confirmed = False
+    if listed or repriced:
+        auto_confirmed = _auto_confirm_listings(
+            ctx, cfg, cred_steam.get("steam_id", ""), cred_steam.get("cookies", "")
+        )
+
+    if listed and bool(pipeline_cfg.get("sell_reconcile_enabled", True)):
+        _reconcile_listings(
+            ctx, to_list, cred_steam.get("cookies", ""), auto_confirmed, debug_fn=debug_fn
+        )
 
 
 def _run_sell_phase(cfg: dict, state, flow_id: str, items: Optional[list] = None) -> None:

@@ -103,3 +103,26 @@ def test_range_inventory_refresh_seconds_too_short_is_lifted_to_ten_minutes():
         result = _validate_ranges(cfg)
     assert result["inventory"]["refresh_seconds"] == 600
     assert any("inventory.refresh_seconds" in str(w.message) for w in caught)
+def test_defaults_包含挂价上限与薄档阈值():
+    assert DEFAULTS["pipeline"]["sell_price_max_ratio"] == 1.1
+    assert DEFAULTS["pipeline"]["sell_price_min_tier_volume"] == 3
+
+
+def test_range_sell_price_max_ratio_超出范围被限制():
+    cfg = merge(DEFAULTS, {"pipeline": {"sell_price_max_ratio": 0}})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = _validate_ranges(cfg)
+
+    assert result["pipeline"]["sell_price_max_ratio"] > 0
+    assert any("sell_price_max_ratio" in str(w.message) for w in caught)
+
+
+def test_range_sell_price_min_tier_volume_负数被修正为0():
+    cfg = merge(DEFAULTS, {"pipeline": {"sell_price_min_tier_volume": -2}})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = _validate_ranges(cfg)
+
+    assert result["pipeline"]["sell_price_min_tier_volume"] == 0
+    assert any("sell_price_min_tier_volume" in str(w.message) for w in caught)
