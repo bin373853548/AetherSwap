@@ -67,6 +67,9 @@ class _PurchaseAttemptStatus(Enum):
     COOLING_DOWN = "cooling_down"
     RISK = "risk"
     TIME_WINDOW_CLOSED = "time_window_closed"
+    TARGET_REACHED = "target_reached"
+    SKIP_NO_FAILED = "skip_no_failed"
+    SKIP_VERIFICATION_FAILED = "skip_verification_failed"
     FAILED = "failed"
 
 
@@ -1546,47 +1549,6 @@ def lock_and_confirm_payment(
         elif daily_vol <= 0 and log_fn:
             log_fn("[Buff]   → 卖压检查: 日销量为0，跳过", "info")
 
-    # Steam/history validation can take longer than the BUFF cache TTL. Verify
-    # freshness again immediately before choosing the order that will be sent
-    # to the write endpoint; never lock against an old sell_order_id.
-    if not _buff_orders_cache_is_fresh(item, orders_cache_ttl):
-        refreshed_orders = buff_client.get_sell_orders(goods_id, game_buff)
-        if not refreshed_orders:
-            if log_fn:
-                log_fn("[Buff]   → 锁单前卖单缓存已过期且刷新失败，停止本次购买", "warn")
-            return None
-        orders = refreshed_orders
-        _cache_buff_sell_orders(item, orders)
-        lowest_price, count_at_lowest = count_lowest_price_orders(orders)
-        if lowest_price <= 0:
-            if log_fn:
-                log_fn("[Buff]   → 锁单前刷新得到的最低价无效，停止本次购买", "warn")
-            return None
-        if log_fn:
-            log_fn(
-                f"[Buff]   → 锁单前缓存超过 {orders_cache_ttl:.1f} 秒，已刷新为最低价={lowest_price:.2f} 数量={count_at_lowest}",
-                "info",
-            )
-        if _affordable_quantity(target_balance, acc, lowest_price) < 1:
-            return TARGET_REACHED
-        if plan_price is not None and lowest_price - plan_price > tolerance:
-            if log_fn:
-                log_fn("[Buff]   → 锁单前刷新后价格超出容忍，停止本次购买", "warn")
-            return None
-        if max_discount is not None:
-            if ref_price is None or ref_price <= 0:
-                return SKIP_VERIFICATION_FAILED
-            refreshed_ratio = (lowest_price / ref_price) * STEAM_FEE_FACTOR
-            if refreshed_ratio >= max_discount:
-                if log_fn:
-                    log_fn(
-                        f"[Buff]   → 锁单前刷新后二次验证未通过，比例={refreshed_ratio:.4f} 需<{max_discount}",
-                        "warn",
-                    )
-                return SKIP_VERIFICATION_FAILED
-        if ref_price and lowest_price > 0:
-            item["value_ratio"] = (lowest_price / ref_price) * STEAM_FEE_FACTOR
-
     buy_runtime = ((config or {}).get("_strategy_runtime") or {}).get("buy")
     if buy_runtime:
         legacy_safe_enabled = is_strategy_module_enabled(config, "buy", "guard.safe_purchase_limit", default=False)
@@ -1599,50 +1561,8 @@ def lock_and_confirm_payment(
         liquidity_cap_enabled = True
         low_price_guard_enabled = True
         held_same_guard_enabled = True
-    safe_purchase_enabled = any((
-        hard_cap_enabled,
-        liquidity_cap_enabled,
-        low_price_guard_enabled,
-        held_same_guard_enabled,
-    ))
-    if safe_purchase_enabled:
-        cap_candidates = []
-        daily_volume = int(item.get("daily_volume", 0) or 0)
-        is_low_price = lowest_price < float(scfg.get("safe_purchase_low_price_threshold", 5.0))
-        if hard_cap_enabled:
-            cap_candidates.append(int(scfg.get("safe_purchase_hard_qty_cap", 50)))
-        if liquidity_cap_enabled:
-            volume_cap = int(daily_volume * float(scfg.get("safe_purchase_liquidity_ratio", 0.05)))
-            if low_price_guard_enabled and is_low_price:
-                volume_cap = int(volume_cap * float(scfg.get("safe_purchase_low_price_penalty", 0.5)))
-            cap_candidates.append(volume_cap)
-        if low_price_guard_enabled and is_low_price:
-            cap_candidates.append(int(scfg.get("safe_purchase_low_price_hard_cap", 30)))
-        safe_limit = max(min(cap_candidates), 0) if cap_candidates else count_at_lowest
-    else:
-        safe_limit = count_at_lowest
-    item_name = market_hash_name
-    if item_name and held_same_guard_enabled:
-        purchases_snapshot = get_purchases()
-        holdings = [p for p in purchases_snapshot if not (p.get("sale_price") and float(p.get("sale_price", 0) or 0) > 0)]
-        held_same = sum(1 for p in holdings if (p.get("name") or "").strip() == item_name)
-        safe_limit = max(0, safe_limit - held_same)
-        if log_fn and held_same > 0:
-            log_fn(f"[Buff]   → 已持有同名(英文) {held_same} 件，安全上限 {safe_limit + held_same} → {safe_limit}", "info")
-    if safe_limit <= 0:
-        if log_fn:
-            log_fn("[Buff]   → 安全采购模块限制为0，跳过本件", "warn")
-        return SKIP_NO_FAILED
-    affordable_quantity = _affordable_quantity(
-        target_balance,
-        acc,
-        lowest_price,
-    )
-    num_to_buy = min(count_at_lowest, max(1, affordable_quantity))
-    orig_num = num_to_buy
-    num_to_buy = min(num_to_buy, max(1, safe_limit))
-    if log_fn and orig_num > num_to_buy:
-        log_fn(f"[Buff]   → 安全采购上限={safe_limit}，原计划={orig_num} 实际购买={num_to_buy}", "info")
+    num_to_buy = 0
+
     def _classify_failure(result: Optional[Dict[str, Any]]) -> _PurchaseAttempt:
         if not result:
             return _PurchaseAttempt(
@@ -1706,12 +1626,110 @@ def lock_and_confirm_payment(
             batch_id=batch_id,
         )
 
-    def _write_snapshot_is_fresh() -> bool:
-        if _buff_orders_cache_is_fresh(item, orders_cache_ttl):
-            return True
-        if log_fn:
-            log_fn("[Buff]   → 写入前卖单快照已超过 TTL，本次不发送锁单请求", "warn")
-        return False
+    def _prepare_purchase_plan() -> Optional[_PurchaseAttempt]:
+        """Refresh stale quotes and recompute every price-dependent limit."""
+        nonlocal orders, lowest_price, count_at_lowest, num_to_buy
+        # Read holdings first: slow local work must not age a freshly fetched quote.
+        held_same = 0
+        if market_hash_name and held_same_guard_enabled:
+            purchases_snapshot = get_purchases()
+            holdings = [p for p in purchases_snapshot if not (p.get("sale_price") and float(p.get("sale_price", 0) or 0) > 0)]
+            held_same = sum(1 for p in holdings if (p.get("name") or "").strip() == market_hash_name)
+        if not _buff_orders_cache_is_fresh(item, orders_cache_ttl):
+            if log_fn:
+                log_fn(
+                    f"[Buff]   → 卖单快照已超过 {orders_cache_ttl:.1f} 秒 TTL，重新拉取后再决定是否锁单",
+                    "info",
+                )
+            fetch_orders = getattr(buff_client, "get_sell_orders", None)
+            refreshed_orders = (
+                fetch_orders(goods_id, game_buff) if callable(fetch_orders) else None
+            )
+            if not refreshed_orders:
+                if log_fn:
+                    log_fn("[Buff]   → 快照过期且刷新失败，本次不发送锁单请求", "warn")
+                return _PurchaseAttempt(
+                    _PurchaseAttemptStatus.FAILED,
+                    reason="卖单快照已过期且刷新失败",
+                )
+            orders = refreshed_orders
+            _cache_buff_sell_orders(item, orders)
+            if log_fn:
+                refreshed_price, refreshed_count = count_lowest_price_orders(orders)
+                log_fn(
+                    f"[Buff]   → 已刷新卖单快照 → 最低价={refreshed_price:.2f} 同价数量={refreshed_count}",
+                    "info",
+                )
+        lowest_price, count_at_lowest = count_lowest_price_orders(orders)
+        if lowest_price <= 0 or count_at_lowest <= 0:
+            if log_fn:
+                log_fn("[Buff]   → 刷新后最低价无效，本次不发送锁单请求", "warn")
+            return _PurchaseAttempt(
+                _PurchaseAttemptStatus.FAILED,
+                reason="刷新后的卖单最低价无效",
+            )
+        affordable_quantity = _affordable_quantity(target_balance, acc, lowest_price)
+        if affordable_quantity < 1:
+            return _PurchaseAttempt(
+                _PurchaseAttemptStatus.TARGET_REACHED,
+                reason="刷新后价格超出剩余预算",
+            )
+        if plan_price is not None and lowest_price - plan_price > tolerance:
+            if log_fn:
+                log_fn("[Buff]   → 刷新后价格超出容忍，本次不发送锁单请求", "warn")
+            return _PurchaseAttempt(
+                _PurchaseAttemptStatus.FAILED,
+                reason="刷新后的卖单价格超出容忍",
+            )
+        if max_discount is not None:
+            if ref_price is None or ref_price <= 0:
+                return _PurchaseAttempt(
+                    _PurchaseAttemptStatus.SKIP_VERIFICATION_FAILED,
+                    reason="刷新后缺少 Steam 参考价",
+                )
+            refreshed_ratio = (lowest_price / ref_price) * STEAM_FEE_FACTOR
+            if refreshed_ratio >= max_discount:
+                if log_fn:
+                    log_fn(
+                        f"[Buff]   → 刷新后二次验证未通过，比例={refreshed_ratio:.4f} 需<{max_discount}",
+                        "warn",
+                    )
+                return _PurchaseAttempt(
+                    _PurchaseAttemptStatus.SKIP_VERIFICATION_FAILED,
+                    reason="刷新后的卖单未通过二次验证",
+                )
+        if ref_price and lowest_price > 0:
+            item["value_ratio"] = (lowest_price / ref_price) * STEAM_FEE_FACTOR
+        cap_candidates = []
+        daily_volume = int(item.get("daily_volume", 0) or 0)
+        is_low_price = lowest_price < float(scfg.get("safe_purchase_low_price_threshold", 5.0))
+        if hard_cap_enabled:
+            cap_candidates.append(int(scfg.get("safe_purchase_hard_qty_cap", 50)))
+        if liquidity_cap_enabled:
+            volume_cap = int(daily_volume * float(scfg.get("safe_purchase_liquidity_ratio", 0.05)))
+            if low_price_guard_enabled and is_low_price:
+                volume_cap = int(volume_cap * float(scfg.get("safe_purchase_low_price_penalty", 0.5)))
+            cap_candidates.append(volume_cap)
+        if low_price_guard_enabled and is_low_price:
+            cap_candidates.append(int(scfg.get("safe_purchase_low_price_hard_cap", 30)))
+        safe_limit = max(min(cap_candidates), 0) if cap_candidates else count_at_lowest
+        if held_same > 0:
+            previous_limit = safe_limit
+            safe_limit = max(0, safe_limit - held_same)
+            if log_fn:
+                log_fn(f"[Buff]   → 已持有同名(英文) {held_same} 件，安全上限 {previous_limit} → {safe_limit}", "info")
+        if safe_limit <= 0:
+            if log_fn:
+                log_fn("[Buff]   → 安全采购模块限制为0，跳过本件", "warn")
+            return _PurchaseAttempt(
+                _PurchaseAttemptStatus.SKIP_NO_FAILED,
+                reason="安全采购模块限制为0",
+            )
+        orig_num = min(count_at_lowest, affordable_quantity)
+        num_to_buy = min(orig_num, safe_limit)
+        if log_fn and orig_num > num_to_buy:
+            log_fn(f"[Buff]   → 安全采购上限={safe_limit}，原计划={orig_num} 实际购买={num_to_buy}", "info")
+        return None
 
     def _time_window_is_open() -> bool:
         if is_time_allowed is None:
@@ -1723,11 +1741,9 @@ def lock_and_confirm_payment(
             return False
 
     def _try_single_buy() -> _PurchaseAttempt:
-        if not _write_snapshot_is_fresh():
-            return _PurchaseAttempt(
-                _PurchaseAttemptStatus.FAILED,
-                reason="写入前卖单快照已过期",
-            )
+        plan_failure = _prepare_purchase_plan()
+        if plan_failure is not None:
+            return plan_failure
         o = first_order_at_price(orders, lowest_price)
         if not o:
             return _PurchaseAttempt(
@@ -1997,10 +2013,13 @@ def lock_and_confirm_payment(
                 _PurchaseAttemptStatus.SAFE_TO_FALLBACK,
                 reason="当前支付方式不支持批量购买，且尚未发送写请求",
             )
-        if not _write_snapshot_is_fresh():
+        plan_failure = _prepare_purchase_plan()
+        if plan_failure is not None:
+            return plan_failure
+        if num_to_buy == 1:
             return _PurchaseAttempt(
-                _PurchaseAttemptStatus.FAILED,
-                reason="写入前卖单快照已过期",
+                _PurchaseAttemptStatus.SAFE_TO_FALLBACK,
+                reason="重新校验后仅可购买1件，未发送批量写请求",
             )
         if not _time_window_is_open():
             return _PurchaseAttempt(
@@ -2265,8 +2284,17 @@ def lock_and_confirm_payment(
             )
         if attempt.status is _PurchaseAttemptStatus.TIME_WINDOW_CLOSED:
             return TIME_WINDOW_CLOSED
+        if attempt.status is _PurchaseAttemptStatus.TARGET_REACHED:
+            return TARGET_REACHED
+        if attempt.status is _PurchaseAttemptStatus.SKIP_NO_FAILED:
+            return SKIP_NO_FAILED
+        if attempt.status is _PurchaseAttemptStatus.SKIP_VERIFICATION_FAILED:
+            return SKIP_VERIFICATION_FAILED
         return None
 
+    plan_failure = _prepare_purchase_plan()
+    if plan_failure is not None:
+        return _finish_attempt(plan_failure)
     if num_to_buy == 1:
         return _finish_attempt(_try_single_buy())
 
